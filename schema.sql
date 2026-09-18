@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS orders (
+  id VARCHAR(40) PRIMARY KEY,
+  openid VARCHAR(128) NOT NULL,
+  partner_name VARCHAR(64) NOT NULL,
+  partner_tag VARCHAR(128) DEFAULT '',
+  partner_initial VARCHAR(8) DEFAULT '',
+  partner_color VARCHAR(24) DEFAULT '',
+  service VARCHAR(128) DEFAULT '',
+  start_time VARCHAR(64) NOT NULL,
+  quantity INT NOT NULL,
+  unit VARCHAR(12) NOT NULL,
+  price_mode VARCHAR(12) NOT NULL,
+  total_price DECIMAL(10,2) NOT NULL,
+  payment_method VARCHAR(32) NOT NULL,
+  remark VARCHAR(300) DEFAULT '',
+  status ENUM('pending','progress','completed','cancelled') NOT NULL DEFAULT 'pending',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_orders_openid_created_at (openid, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
