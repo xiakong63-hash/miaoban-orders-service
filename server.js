@@ -5,7 +5,7 @@ const mysql = require('mysql2/promise');
 const app = express();
 app.use(express.json());
 
-const dbConfig = {
+const pool = mysql.createPool({
   host: process.env.MYSQL_HOST || process.env.MYSQL_ADDRESS || '127.0.0.1',
   port: Number(process.env.MYSQL_PORT || 3306),
   user: process.env.MYSQL_USERNAME || process.env.MYSQL_USER,
@@ -14,17 +14,26 @@ const dbConfig = {
   waitForConnections: true,
   connectionLimit: 5,
   charset: 'utf8mb4'
-};
-
-const pool = mysql.createPool(dbConfig);
-const validStatuses = new Set(['pending', 'progress', 'completed', 'cancelled']);
+});
 
 function send(res, code, data, message) {
   res.status(code === 0 ? 200 : 400).json({ code, data: data || null, message: message || '' });
 }
 
-function openid(req) {
+function getOpenid(req) {
   return req.get('x-wx-openid') || req.get('X-WX-OPENID') || '';
+}
+
+function adminOpenids() {
+  return new Set(String(process.env.ADMIN_OPENIDS || '').split(',').map((item) => item.trim()).filter(Boolean));
+}
+
+function isAdmin(openid) {
+  return adminOpenids().has(openid);
+}
+
+function formatDate(value) {
+  return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '';
 }
 
 function orderRow(row) {
@@ -43,8 +52,46 @@ function orderRow(row) {
     paymentMethod: row.payment_method,
     remark: row.remark,
     status: row.status,
-    createdAt: new Date(row.created_at).toLocaleString('zh-CN', { hour12: false })
+    createdAt: formatDate(row.created_at)
   };
+}
+
+function profileRow(row, openid) {
+  return {
+    nickName: row && row.nick_name ? row.nick_name : '',
+    avatarUrl: row && row.avatar_url ? row.avatar_url : '',
+    gender: row && row.gender ? row.gender : '未知',
+    birthDate: row && row.birth_date ? String(row.birth_date).slice(0, 10) : '',
+    bio: row && row.bio ? row.bio : '',
+    isGuest: !(row && row.nick_name),
+    isAdmin: isAdmin(openid)
+  };
+}
+
+async function ensureUser(openid) {
+  await pool.query(
+    'INSERT INTO users (openid, last_login_at) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE last_login_at = NOW()',
+    [openid]
+  );
+}
+
+function requireOpenid(req, res) {
+  const value = getOpenid(req);
+  if (!value) {
+    send(res, 4001, null, '未获取到用户身份');
+    return '';
+  }
+  return value;
+}
+
+function requireAdmin(req, res) {
+  const value = requireOpenid(req, res);
+  if (!value) return '';
+  if (!isAdmin(value)) {
+    send(res, 4006, null, '无后台访问权限');
+    return '';
+  }
+  return value;
 }
 
 app.get('/api/health', async (req, res) => {
@@ -56,14 +103,63 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-app.get('/api/orders', async (req, res) => {
-  const userOpenid = openid(req);
-  if (!userOpenid) return send(res, 4001, null, '未获取到用户身份');
+app.get('/api/profile', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
   try {
-    const [rows] = await pool.query(
-      'SELECT * FROM orders WHERE openid = ? ORDER BY created_at DESC',
+    console.info('Profile accessed by OpenID:', userOpenid);
+    await ensureUser(userOpenid);
+    const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [userOpenid]);
+    const [[stats]] = await pool.query(
+      `SELECT COUNT(*) AS orderCount, SUM(status = 'pending') AS pendingCount,
+       SUM(status = 'completed') AS completedCount FROM orders WHERE openid = ?`,
       [userOpenid]
     );
+    send(res, 0, {
+      profile: profileRow(user, userOpenid),
+      stats: {
+        orderCount: Number(stats.orderCount || 0),
+        pendingCount: Number(stats.pendingCount || 0),
+        completedCount: Number(stats.completedCount || 0)
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '用户资料读取失败');
+  }
+});
+
+app.patch('/api/profile', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const body = req.body || {};
+  const nickName = String(body.nickName || '').trim().slice(0, 32);
+  const avatarUrl = String(body.avatarUrl || '').trim().slice(0, 512);
+  const gender = ['男', '女', '未知'].includes(body.gender) ? body.gender : '未知';
+  const birthDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.birthDate || '')) ? body.birthDate : null;
+  const bio = String(body.bio || '').trim().slice(0, 160);
+  if (!nickName) return send(res, 4002, null, '请填写昵称');
+  try {
+    await pool.query(
+      `INSERT INTO users (openid, nick_name, avatar_url, gender, birth_date, bio, last_login_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())
+       ON DUPLICATE KEY UPDATE nick_name = VALUES(nick_name), avatar_url = VALUES(avatar_url),
+         gender = VALUES(gender), birth_date = VALUES(birth_date), bio = VALUES(bio), last_login_at = NOW()`,
+      [userOpenid, nickName, avatarUrl, gender, birthDate, bio]
+    );
+    const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [userOpenid]);
+    send(res, 0, { profile: profileRow(user, userOpenid) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '用户资料保存失败');
+  }
+});
+
+app.get('/api/orders', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query('SELECT * FROM orders WHERE openid = ? ORDER BY created_at DESC', [userOpenid]);
     send(res, 0, { orders: rows.map(orderRow) });
   } catch (error) {
     console.error(error);
@@ -72,26 +168,24 @@ app.get('/api/orders', async (req, res) => {
 });
 
 app.post('/api/orders', async (req, res) => {
-  const userOpenid = openid(req);
-  if (!userOpenid) return send(res, 4001, null, '未获取到用户身份');
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
   const body = req.body || {};
   const required = ['partnerName', 'startTime', 'quantity', 'unit', 'priceMode', 'totalPrice', 'paymentMethod'];
-  if (required.some((key) => body[key] === undefined || body[key] === '')) {
-    return send(res, 4002, null, '订单信息不完整');
-  }
+  if (required.some((key) => body[key] === undefined || body[key] === '')) return send(res, 4002, null, '订单信息不完整');
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
-  const order = { ...body, id, status: 'pending' };
   try {
+    await ensureUser(userOpenid);
     await pool.query(
       `INSERT INTO orders (id, openid, partner_name, partner_tag, partner_initial, partner_color, service,
         start_time, quantity, unit, price_mode, total_price, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, userOpenid, order.partnerName, order.partnerTag || '', order.partnerInitial || '', order.partnerColor || '',
-        order.service || '', order.startTime, Number(order.quantity), order.unit, order.priceMode,
-        Number(order.totalPrice), order.paymentMethod, order.remark || '', 'pending']
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [id, userOpenid, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
+        body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
+        Number(body.totalPrice), body.paymentMethod, body.remark || '']
     );
-    const [rows] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
-    send(res, 0, { order: orderRow(rows[0]) });
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
+    send(res, 0, { order: orderRow(order) });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '订单创建失败');
@@ -99,8 +193,8 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.patch('/api/orders/:id/cancel', async (req, res) => {
-  const userOpenid = openid(req);
-  if (!userOpenid) return send(res, 4001, null, '未获取到用户身份');
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
   try {
     const [result] = await pool.query(
       "UPDATE orders SET status = 'cancelled' WHERE id = ? AND openid = ? AND status IN ('pending', 'progress')",
@@ -111,6 +205,58 @@ app.patch('/api/orders/:id/cancel', async (req, res) => {
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '订单取消失败');
+  }
+});
+
+app.get('/api/admin/summary', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const [[users]] = await pool.query(
+      `SELECT COUNT(*) AS totalUsers, SUM(DATE(created_at) = CURDATE()) AS todayNew,
+       SUM(created_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)) AS weekNew FROM users`
+    );
+    const [[orders]] = await pool.query(
+      `SELECT COUNT(*) AS orderCount, SUM(status = 'pending') AS pendingCount,
+       COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN total_price ELSE 0 END), 0) AS revenue FROM orders`
+    );
+    send(res, 0, {
+      totalUsers: Number(users.totalUsers || 0), todayNew: Number(users.todayNew || 0), weekNew: Number(users.weekNew || 0),
+      orderCount: Number(orders.orderCount || 0), pendingCount: Number(orders.pendingCount || 0), revenue: Number(orders.revenue || 0)
+    });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '运营数据读取失败');
+  }
+});
+
+app.get('/api/admin/users', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const keyword = String(req.query.keyword || '').trim().slice(0, 32);
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(10, Number(req.query.pageSize) || 30));
+  const where = keyword ? 'WHERE u.nick_name LIKE ? OR u.openid LIKE ?' : '';
+  const params = keyword ? [`%${keyword}%`, `%${keyword}%`] : [];
+  try {
+    const [[totalRow]] = await pool.query(`SELECT COUNT(*) AS total FROM users u ${where}`, params);
+    const [rows] = await pool.query(
+      `SELECT u.openid, u.nick_name, u.avatar_url, u.gender, u.birth_date, u.bio, u.created_at, u.last_login_at,
+       COUNT(o.id) AS order_count, COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total_price ELSE 0 END), 0) AS total_spent
+       FROM users u LEFT JOIN orders o ON u.openid = o.openid ${where}
+       GROUP BY u.openid ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
+      [...params, pageSize, (page - 1) * pageSize]
+    );
+    send(res, 0, {
+      total: Number(totalRow.total || 0), page, pageSize,
+      users: rows.map((row) => ({
+        openid: row.openid, nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', gender: row.gender || '未知',
+        birthDate: row.birth_date ? String(row.birth_date).slice(0, 10) : '', bio: row.bio || '',
+        createdAt: formatDate(row.created_at), lastLoginAt: formatDate(row.last_login_at),
+        orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0)
+      }))
+    });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '用户列表读取失败');
   }
 });
 
