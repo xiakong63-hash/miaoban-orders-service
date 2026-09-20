@@ -56,6 +56,7 @@ function orderRow(row) {
     originalTotalPrice: row.original_total_price === undefined || row.original_total_price === null ? Number(row.total_price) : Number(row.original_total_price),
     catFoodUsed: Number(row.cat_food_used || 0),
     couponDiscount: Number(row.coupon_discount || 0),
+    renewFromOrderId: row.renew_from_order_id || '',
     pointsEarned: Number(row.points_earned || 0),
     paymentMethod: row.payment_method,
     remark: row.remark,
@@ -607,6 +608,40 @@ app.post('/api/orders', async (req, res) => {
   } finally {
     if (connection) connection.release();
   }
+});
+
+app.post('/api/orders/:id/renew', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const requestedQuantity = Math.floor(Number((req.body || {}).quantity));
+  const requestedUnit = (req.body || {}).unit === '局' ? '局' : '小时';
+  if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) return send(res, 4002, null, '请输入有效的续单数量');
+  let connection;
+  try {
+    const [[source]] = await pool.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND status IN ('progress', 'completed')", [req.params.id, userOpenid]);
+    if (!source) return send(res, 4004, null, '仅服务中或已完成订单可以续单');
+    const renewUnit = requestedUnit;
+    const maxQuantity = renewUnit === '局' ? 99 : 24;
+    const quantity = Math.min(requestedQuantity, maxQuantity);
+    const sourceQuantity = Math.max(1, Number(source.quantity || 1));
+    const baseAmount = Number(source.original_total_price === null || source.original_total_price === undefined ? source.total_price : source.original_total_price);
+    const unitPrice = money(baseAmount / sourceQuantity);
+    const totalPrice = money(unitPrice * quantity);
+    const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    await connection.query(
+      `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
+        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, points_earned, payment_method, remark, status, renew_from_order_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '立即开始', ?, ?, ?, ?, ?, 0, 0, NULL, 0, ?, ?, 'pending', ?)`,
+      [id, userOpenid, source.partner_profile_id, source.partner_name, source.partner_tag, source.partner_initial, source.partner_color, source.partner_avatar_url, source.partner_gender, source.partner_rank_text, source.service,
+        quantity, renewUnit, renewUnit === '局' ? 'game' : 'hour', totalPrice, totalPrice, source.payment_method, `续自订单 ${source.id} · 按${renewUnit}续单`, source.id]
+    );
+    await connection.commit();
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '续单创建失败'); }
+  finally { if (connection) connection.release(); }
 });
 
 app.patch('/api/orders/:id/cancel', async (req, res) => {
