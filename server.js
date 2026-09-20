@@ -58,6 +58,7 @@ function orderRow(row) {
 
 function profileRow(row, openid) {
   return {
+    registrationNo: row && row.user_no ? row.user_no : '',
     nickName: row && row.nick_name ? row.nick_name : '',
     avatarUrl: row && row.avatar_url ? row.avatar_url : '',
     gender: row && row.gender ? row.gender : '未知',
@@ -68,11 +69,70 @@ function profileRow(row, openid) {
   };
 }
 
+function partnerRow(row, includeOpenid) {
+  if (!row) return null;
+  const result = {
+    id: row.id,
+    partnerNo: row.partner_no || '',
+    name: row.display_name || '未命名陪陪',
+    avatarUrl: row.avatar_url || '',
+    initial: (row.display_name || '喵').slice(0, 1),
+    gameName: row.game_name || '',
+    game: row.game || '无畏契约',
+    level: row.service_level || '娱乐',
+    rankText: row.rank_text || '',
+    description: row.description || '',
+    audioUrl: row.audio_url || '',
+    audioDuration: Number(row.audio_duration || 0),
+    hourPrice: Number(row.hour_price || 0),
+    gamePrice: Number(row.game_price || 0),
+    availableTime: row.available_time || '',
+    status: row.status || 'pending',
+    createdAt: formatDate(row.created_at),
+    updatedAt: formatDate(row.updated_at)
+  };
+  result.tag = `${result.game} · ${result.level}陪陪`;
+  result.service = `${result.game}${result.level}陪玩`;
+  if (includeOpenid) result.openid = row.openid;
+  return result;
+}
+
 async function ensureUser(openid) {
-  await pool.query(
-    'INSERT INTO users (openid, last_login_at) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE last_login_at = NOW()',
-    [openid]
-  );
+  const [[existing]] = await pool.query('SELECT user_no FROM users WHERE openid = ?', [openid]);
+  if (existing && existing.user_no) {
+    await pool.query('UPDATE users SET last_login_at = NOW() WHERE openid = ?', [openid]);
+    return existing.user_no;
+  }
+
+  const [sequence] = await pool.query('INSERT INTO user_sequence () VALUES ()');
+  const userNo = `MBU${String(sequence.insertId).padStart(6, '0')}`;
+  if (existing) {
+    await pool.query('UPDATE users SET user_no = ?, last_login_at = NOW() WHERE openid = ? AND user_no IS NULL', [userNo, openid]);
+    return userNo;
+  }
+
+  try {
+    await pool.query('INSERT INTO users (openid, user_no, last_login_at) VALUES (?, ?, NOW())', [openid, userNo]);
+    return userNo;
+  } catch (error) {
+    if (error && error.code === 'ER_DUP_ENTRY') {
+      const [[row]] = await pool.query('SELECT user_no FROM users WHERE openid = ?', [openid]);
+      return row && row.user_no;
+    }
+    throw error;
+  }
+}
+
+async function ensurePartnerNo(openid) {
+  const [[existing]] = await pool.query('SELECT partner_no FROM partner_profiles WHERE openid = ?', [openid]);
+  if (existing && existing.partner_no) return existing.partner_no;
+  const [sequence] = await pool.query('INSERT INTO partner_sequence () VALUES ()');
+  const partnerNo = `MBP${String(sequence.insertId).padStart(6, '0')}`;
+  if (existing) {
+    await pool.query('UPDATE partner_profiles SET partner_no = ? WHERE openid = ? AND partner_no IS NULL', [partnerNo, openid]);
+    return partnerNo;
+  }
+  return partnerNo;
 }
 
 function requireOpenid(req, res) {
@@ -140,18 +200,98 @@ app.patch('/api/profile', async (req, res) => {
   const bio = String(body.bio || '').trim().slice(0, 160);
   if (!nickName) return send(res, 4002, null, '请填写昵称');
   try {
+    await ensureUser(userOpenid);
     await pool.query(
-      `INSERT INTO users (openid, nick_name, avatar_url, gender, birth_date, bio, last_login_at)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())
-       ON DUPLICATE KEY UPDATE nick_name = VALUES(nick_name), avatar_url = VALUES(avatar_url),
-         gender = VALUES(gender), birth_date = VALUES(birth_date), bio = VALUES(bio), last_login_at = NOW()`,
-      [userOpenid, nickName, avatarUrl, gender, birthDate, bio]
+      `UPDATE users SET nick_name = ?, avatar_url = ?, gender = ?, birth_date = ?, bio = ?, last_login_at = NOW()
+       WHERE openid = ?`, [nickName, avatarUrl, gender, birthDate, bio, userOpenid]
     );
     const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [userOpenid]);
     send(res, 0, { profile: profileRow(user, userOpenid) });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '用户资料保存失败');
+  }
+});
+
+app.get('/api/partner/me', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    await ensureUser(userOpenid);
+    const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE openid = ?', [userOpenid]);
+    send(res, 0, { partner: partnerRow(partner, false) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '陪陪资料读取失败');
+  }
+});
+
+app.post('/api/partner/apply', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const body = req.body || {};
+  const displayName = String(body.displayName || '').trim().slice(0, 32);
+  const avatarUrl = String(body.avatarUrl || '').trim().slice(0, 512);
+  const gameName = String(body.gameName || '').trim().slice(0, 32);
+  const game = String(body.game || '无畏契约').trim().slice(0, 32);
+  const level = ['娱乐', '娱技', '技术', '顶尖'].includes(body.level) ? body.level : '';
+  const rankText = String(body.rankText || '').trim().slice(0, 32);
+  const description = String(body.description || '').trim().slice(0, 160);
+  const audioUrl = String(body.audioUrl || '').trim().slice(0, 512);
+  const audioDuration = Math.round(Number(body.audioDuration) || 0);
+  const hourPrice = Number(body.hourPrice);
+  const gamePrice = Number(body.gamePrice);
+  const availableTime = String(body.availableTime || '').trim().slice(0, 80);
+  if (!displayName || !gameName || !level || !rankText || !description || !availableTime || !Number.isFinite(hourPrice) || hourPrice <= 0 || !Number.isFinite(gamePrice) || gamePrice <= 0) {
+    return send(res, 4002, null, '请完整填写陪陪资料和价格');
+  }
+  if ((audioUrl && (audioDuration < 1 || audioDuration > 12)) || (!audioUrl && audioDuration)) return send(res, 4002, null, '介绍语音时长需为 1 至 12 秒');
+  try {
+    await ensureUser(userOpenid);
+    const partnerNo = await ensurePartnerNo(userOpenid);
+    await pool.query(
+      `INSERT INTO partner_profiles (openid, partner_no, display_name, avatar_url, game_name, game, service_level, rank_text, description, audio_url, audio_duration, hour_price, game_price, available_time, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+       ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), avatar_url = VALUES(avatar_url), game_name = VALUES(game_name),
+       game = VALUES(game), service_level = VALUES(service_level), rank_text = VALUES(rank_text), description = VALUES(description),
+       audio_url = VALUES(audio_url), audio_duration = VALUES(audio_duration), hour_price = VALUES(hour_price), game_price = VALUES(game_price), available_time = VALUES(available_time), status = 'pending'`,
+      [userOpenid, partnerNo, displayName, avatarUrl, gameName, game, level, rankText, description, audioUrl, audioDuration, hourPrice, gamePrice, availableTime]
+    );
+    const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE openid = ?', [userOpenid]);
+    send(res, 0, { partner: partnerRow(partner, false) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '陪陪申请提交失败');
+  }
+});
+
+app.get('/api/partners', async (req, res) => {
+  const category = String(req.query.category || '').trim().slice(0, 32);
+  const params = [];
+  let where = "WHERE status = 'approved'";
+  if (category === 'valorant') {
+    where += ' AND game = ?';
+    params.push('无畏契约');
+  }
+  try {
+    const [rows] = await pool.query(`SELECT * FROM partner_profiles ${where} ORDER BY updated_at DESC LIMIT 30`, params);
+    send(res, 0, { partners: rows.map((row) => partnerRow(row, false)) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '陪陪列表读取失败');
+  }
+});
+
+app.get('/api/partners/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '陪陪信息无效');
+  try {
+    const [[partner]] = await pool.query("SELECT * FROM partner_profiles WHERE id = ? AND status = 'approved'", [id]);
+    if (!partner) return send(res, 4004, null, '该陪陪暂不可预约');
+    send(res, 0, { partner: partnerRow(partner, false) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '陪陪资料读取失败');
   }
 });
 
@@ -219,13 +359,54 @@ app.get('/api/admin/summary', async (req, res) => {
       `SELECT COUNT(*) AS orderCount, SUM(status = 'pending') AS pendingCount,
        COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN total_price ELSE 0 END), 0) AS revenue FROM orders`
     );
+    const [[partners]] = await pool.query(
+      "SELECT COUNT(*) AS totalPartners, SUM(status = 'pending') AS pendingPartners, SUM(status = 'approved') AS approvedPartners FROM partner_profiles"
+    );
     send(res, 0, {
       totalUsers: Number(users.totalUsers || 0), todayNew: Number(users.todayNew || 0), weekNew: Number(users.weekNew || 0),
-      orderCount: Number(orders.orderCount || 0), pendingCount: Number(orders.pendingCount || 0), revenue: Number(orders.revenue || 0)
+      orderCount: Number(orders.orderCount || 0), pendingCount: Number(orders.pendingCount || 0), revenue: Number(orders.revenue || 0),
+      totalPartners: Number(partners.totalPartners || 0), pendingPartners: Number(partners.pendingPartners || 0), approvedPartners: Number(partners.approvedPartners || 0)
     });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '运营数据读取失败');
+  }
+});
+
+app.get('/api/admin/partners', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const keyword = String(req.query.keyword || '').trim().slice(0, 32);
+  const status = ['pending', 'approved', 'rejected', 'offline'].includes(req.query.status) ? req.query.status : '';
+  const clauses = [];
+  const params = [];
+  if (keyword) {
+    clauses.push('(partner_no LIKE ? OR display_name LIKE ? OR game_name LIKE ? OR openid LIKE ?)');
+    params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
+  }
+  if (status) { clauses.push('status = ?'); params.push(status); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  try {
+    const [rows] = await pool.query(`SELECT * FROM partner_profiles ${where} ORDER BY FIELD(status, 'pending', 'approved', 'offline', 'rejected'), updated_at DESC LIMIT 100`, params);
+    send(res, 0, { partners: rows.map((row) => partnerRow(row, true)) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '陪陪审核列表读取失败');
+  }
+});
+
+app.patch('/api/admin/partners/:id/status', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  const status = String((req.body || {}).status || '');
+  if (!Number.isInteger(id) || id <= 0 || !['approved', 'rejected', 'offline'].includes(status)) return send(res, 4002, null, '审核状态无效');
+  try {
+    const [result] = await pool.query('UPDATE partner_profiles SET status = ? WHERE id = ?', [status, id]);
+    if (!result.affectedRows) return send(res, 4004, null, '陪陪资料不存在');
+    const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE id = ?', [id]);
+    send(res, 0, { partner: partnerRow(partner, true) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '审核状态更新失败');
   }
 });
 
@@ -234,12 +415,12 @@ app.get('/api/admin/users', async (req, res) => {
   const keyword = String(req.query.keyword || '').trim().slice(0, 32);
   const page = Math.max(1, Number(req.query.page) || 1);
   const pageSize = Math.min(100, Math.max(10, Number(req.query.pageSize) || 30));
-  const where = keyword ? 'WHERE u.nick_name LIKE ? OR u.openid LIKE ?' : '';
-  const params = keyword ? [`%${keyword}%`, `%${keyword}%`] : [];
+  const where = keyword ? 'WHERE u.nick_name LIKE ? OR u.user_no LIKE ? OR u.openid LIKE ?' : '';
+  const params = keyword ? [`%${keyword}%`, `%${keyword}%`, `%${keyword}%`] : [];
   try {
     const [[totalRow]] = await pool.query(`SELECT COUNT(*) AS total FROM users u ${where}`, params);
     const [rows] = await pool.query(
-      `SELECT u.openid, u.nick_name, u.avatar_url, u.gender, u.birth_date, u.bio, u.created_at, u.last_login_at,
+      `SELECT u.openid, u.user_no, u.nick_name, u.avatar_url, u.gender, u.birth_date, u.bio, u.created_at, u.last_login_at,
        COUNT(o.id) AS order_count, COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total_price ELSE 0 END), 0) AS total_spent
        FROM users u LEFT JOIN orders o ON u.openid = o.openid ${where}
        GROUP BY u.openid ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
@@ -248,7 +429,7 @@ app.get('/api/admin/users', async (req, res) => {
     send(res, 0, {
       total: Number(totalRow.total || 0), page, pageSize,
       users: rows.map((row) => ({
-        openid: row.openid, nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', gender: row.gender || '未知',
+        openid: row.openid, registrationNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', gender: row.gender || '未知',
         birthDate: row.birth_date ? String(row.birth_date).slice(0, 10) : '', bio: row.bio || '',
         createdAt: formatDate(row.created_at), lastLoginAt: formatDate(row.last_login_at),
         orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0)
