@@ -70,6 +70,26 @@ function earlySettlementNotice(serviceSeconds, unit) {
   return '已按原订单服务费用结算';
 }
 
+const INITIAL_COIN_BALANCE = 268;
+
+function money(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+async function ensureWallet(executor, openid) {
+  await executor.query('INSERT IGNORE INTO user_wallets (openid, coin_balance, cat_food_balance) VALUES (?, ?, 0)', [openid, INITIAL_COIN_BALANCE]);
+  const [[wallet]] = await executor.query('SELECT * FROM user_wallets WHERE openid = ?', [openid]);
+  return wallet;
+}
+
+async function addWalletRecord(executor, openid, values) {
+  await executor.query(
+    `INSERT INTO wallet_transactions (openid, coin_delta, cat_food_delta, transaction_type, title, amount, order_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [openid, money(values.coinDelta), Number(values.catFoodDelta || 0), values.type, values.title, money(values.amount), values.orderId || null]
+  );
+}
+
 function profileRow(row, openid) {
   return {
     registrationNo: row && row.user_no ? row.user_no : '',
@@ -192,13 +212,15 @@ app.get('/api/profile', async (req, res) => {
        FROM orders WHERE openid = ?`,
       [userOpenid]
     );
+    const wallet = await ensureWallet(pool, userOpenid);
     send(res, 0, {
       profile: profileRow(user, userOpenid),
       stats: {
         orderCount: Number(stats.orderCount || 0),
         pendingCount: Number(stats.pendingCount || 0),
         completedCount: Number(stats.completedCount || 0),
-        pointsBalance: Number(stats.pointsBalance || 0)
+        pointsBalance: Number(stats.pointsBalance || 0) + Number(wallet.cat_food_balance || 0),
+        coinBalance: money(wallet.coin_balance)
       }
     });
   } catch (error) {
@@ -293,44 +315,42 @@ app.patch('/api/partner/orders/:id/start', async (req, res) => {
 });
 
 app.patch('/api/partner/orders/:id/complete', async (req, res) => {
+  let connection;
   try {
     const partner = await requireApprovedPartner(req, res);
     if (!partner) return;
-    const [result] = await pool.query(`
-      UPDATE orders
-      SET status = 'completed',
-          service_completed_at = NOW(),
-          points_earned = GREATEST(0, FLOOR(CASE
-            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 35 * 60
-              THEN total_price / NULLIF(quantity, 0) * 0.5
-            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 65 * 60
-              THEN total_price / NULLIF(quantity, 0)
-            ELSE total_price
-          END)),
-          total_price = CASE
-            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 35 * 60
-              THEN ROUND(total_price / NULLIF(quantity, 0) * 0.5, 2)
-            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 65 * 60
-              THEN ROUND(total_price / NULLIF(quantity, 0), 2)
-            ELSE total_price
-          END
-      WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NOT NULL
-    `, [req.params.id, partner.id]);
-    if (!result.affectedRows) return send(res, 4004, null, '订单尚未开始、已结算或不存在');
-    const [[order]] = await pool.query(`
-      SELECT *, TIMESTAMPDIFF(SECOND, service_started_at, service_completed_at) AS service_seconds
-      FROM orders WHERE id = ? AND partner_profile_id = ?
-    `, [req.params.id, partner.id]);
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[current]] = await connection.query(`SELECT *, TIMESTAMPDIFF(SECOND, service_started_at, NOW()) AS service_seconds
+      FROM orders WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NOT NULL FOR UPDATE`, [req.params.id, partner.id]);
+    if (!current) { await connection.rollback(); return send(res, 4004, null, '订单尚未开始、已结算或不存在'); }
+    const serviceSeconds = Number(current.service_seconds || 0);
+    const originalPrice = money(current.total_price);
+    let settledPrice = originalPrice;
+    if (current.unit === '小时' && serviceSeconds < 35 * 60) settledPrice = money(originalPrice / Number(current.quantity) * 0.5);
+    else if (current.unit === '小时' && serviceSeconds < 65 * 60) settledPrice = money(originalPrice / Number(current.quantity));
+    const refundCoins = money(Math.max(0, originalPrice - settledPrice));
+    const catFood = Math.max(0, Math.floor(settledPrice));
+    await connection.query("UPDATE orders SET status = 'completed', service_completed_at = NOW(), total_price = ?, points_earned = ? WHERE id = ?", [settledPrice, catFood, current.id]);
+    if (refundCoins > 0) {
+      await ensureWallet(connection, current.openid);
+      await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ? WHERE openid = ?', [refundCoins, current.openid]);
+      await addWalletRecord(connection, current.openid, { coinDelta: refundCoins, type: 'early_settlement_refund', title: '提前结单返还金币', amount: refundCoins, orderId: current.id });
+    }
+    await connection.commit();
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
     send(res, 0, {
       order: orderRow(order),
       settlement: {
-        serviceSeconds: Number(order.service_seconds || 0),
-        message: earlySettlementNotice(Number(order.service_seconds || 0), order.unit)
+        serviceSeconds, refundCoins, message: earlySettlementNotice(serviceSeconds, order.unit)
       }
     });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error(error);
     send(res, 5001, null, '订单结算失败');
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -429,6 +449,58 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
+app.get('/api/wallet', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const wallet = await ensureWallet(pool, userOpenid);
+    const [records] = await pool.query('SELECT * FROM wallet_transactions WHERE openid = ? ORDER BY created_at DESC LIMIT 50', [userOpenid]);
+    const [withdrawals] = await pool.query('SELECT * FROM withdrawal_requests WHERE openid = ? ORDER BY created_at DESC LIMIT 20', [userOpenid]);
+    send(res, 0, {
+      balance: money(wallet.coin_balance),
+      catFoodBalance: Number(wallet.cat_food_balance || 0),
+      records: records.map((row) => ({ id: row.id, title: row.title, coinDelta: money(row.coin_delta), catFoodDelta: Number(row.cat_food_delta || 0), createdAt: formatDate(row.created_at) })),
+      withdrawals: withdrawals.map((row) => ({ id: row.id, amount: money(row.amount), status: row.status, createdAt: formatDate(row.created_at) }))
+    });
+  } catch (error) { console.error(error); send(res, 5001, null, '金币钱包读取失败'); }
+});
+
+app.post('/api/wallet/recharge', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const amount = money(req.body && req.body.amount);
+  const gifts = { 6: 0, 30: 1, 68: 4, 128: 10 };
+  if (!Object.prototype.hasOwnProperty.call(gifts, amount)) return send(res, 4002, null, '请选择有效充值档位');
+  try {
+    await ensureWallet(pool, userOpenid);
+    await pool.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance + ? WHERE openid = ?', [amount, gifts[amount], userOpenid]);
+    await addWalletRecord(pool, userOpenid, { coinDelta: amount, catFoodDelta: gifts[amount], type: 'recharge_demo', title: `充值 ¥${amount}`, amount });
+    const wallet = await ensureWallet(pool, userOpenid);
+    send(res, 0, { balance: money(wallet.coin_balance), catFoodGift: gifts[amount] });
+  } catch (error) { console.error(error); send(res, 5001, null, '充值处理失败'); }
+});
+
+app.post('/api/wallet/withdrawals', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const amount = money(req.body && req.body.amount);
+  if (!amount || amount < 10) return send(res, 4002, null, '单次提现至少 10 金币');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    await ensureWallet(connection, userOpenid);
+    const [result] = await connection.query('UPDATE user_wallets SET coin_balance = coin_balance - ? WHERE openid = ? AND coin_balance >= ?', [amount, userOpenid, amount]);
+    if (!result.affectedRows) { await connection.rollback(); return send(res, 4002, null, '金币余额不足'); }
+    await connection.query("INSERT INTO withdrawal_requests (openid, amount, status) VALUES (?, ?, 'pending')", [userOpenid, amount]);
+    await addWalletRecord(connection, userOpenid, { coinDelta: -amount, type: 'withdrawal', title: '提现申请（待处理）', amount });
+    await connection.commit();
+    const wallet = await ensureWallet(pool, userOpenid);
+    send(res, 0, { balance: money(wallet.coin_balance), message: '提现申请已提交，客服审核后将为你处理。' });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '提现申请失败'); }
+  finally { if (connection) connection.release(); }
+});
+
 app.get('/api/points', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
@@ -437,11 +509,12 @@ app.get('/api/points', async (req, res) => {
       "SELECT id, partner_name, service, total_price, points_earned, status, created_at FROM orders WHERE openid = ? AND status <> 'cancelled' AND points_earned > 0 ORDER BY created_at DESC LIMIT 100",
       [userOpenid]
     );
-    const balance = rows.reduce((total, item) => total + Number(item.points_earned || 0), 0);
+    const wallet = await ensureWallet(pool, userOpenid);
+    const balance = rows.reduce((total, item) => total + Number(item.points_earned || 0), 0) + Number(wallet.cat_food_balance || 0);
     send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, partnerName: item.partner_name || '陪陪订单', service: item.service || '', amount: Number(item.total_price || 0), points: Number(item.points_earned || 0), createdAt: formatDate(item.created_at) })) });
   } catch (error) {
     console.error(error);
-    send(res, 5001, null, '积分记录读取失败');
+    send(res, 5001, null, '猫粮记录读取失败');
   }
 });
 
