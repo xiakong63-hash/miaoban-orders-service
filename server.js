@@ -53,6 +53,7 @@ function orderRow(row) {
     unit: row.unit,
     priceMode: row.price_mode,
     totalPrice: Number(row.total_price),
+    pointsEarned: Number(row.points_earned || 0),
     paymentMethod: row.payment_method,
     remark: row.remark,
     status: row.status,
@@ -177,7 +178,9 @@ app.get('/api/profile', async (req, res) => {
     const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [userOpenid]);
     const [[stats]] = await pool.query(
       `SELECT COUNT(*) AS orderCount, SUM(status = 'pending') AS pendingCount,
-       SUM(status = 'completed') AS completedCount FROM orders WHERE openid = ?`,
+       SUM(status = 'completed') AS completedCount,
+       COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN points_earned ELSE 0 END), 0) AS pointsBalance
+       FROM orders WHERE openid = ?`,
       [userOpenid]
     );
     send(res, 0, {
@@ -185,7 +188,8 @@ app.get('/api/profile', async (req, res) => {
       stats: {
         orderCount: Number(stats.orderCount || 0),
         pendingCount: Number(stats.pendingCount || 0),
-        completedCount: Number(stats.completedCount || 0)
+        completedCount: Number(stats.completedCount || 0),
+        pointsBalance: Number(stats.pointsBalance || 0)
       }
     });
   } catch (error) {
@@ -360,6 +364,22 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
+app.get('/api/points', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, partner_name, service, total_price, points_earned, status, created_at FROM orders WHERE openid = ? AND status <> 'cancelled' AND points_earned > 0 ORDER BY created_at DESC LIMIT 100",
+      [userOpenid]
+    );
+    const balance = rows.reduce((total, item) => total + Number(item.points_earned || 0), 0);
+    send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, partnerName: item.partner_name || '陪陪订单', service: item.service || '', amount: Number(item.total_price || 0), points: Number(item.points_earned || 0), createdAt: formatDate(item.created_at) })) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '积分记录读取失败');
+  }
+});
+
 app.post('/api/orders', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
@@ -367,6 +387,7 @@ app.post('/api/orders', async (req, res) => {
   const required = ['partnerName', 'startTime', 'quantity', 'unit', 'priceMode', 'totalPrice', 'paymentMethod'];
   if (required.some((key) => body[key] === undefined || body[key] === '')) return send(res, 4002, null, '订单信息不完整');
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  const pointsEarned = Math.max(0, Math.floor(Number(body.totalPrice) || 0));
   try {
     await ensureUser(userOpenid);
     const requestedPartnerId = Number(body.partnerId);
@@ -377,12 +398,12 @@ app.post('/api/orders', async (req, res) => {
     }
     await pool.query(
       `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
-        start_time, quantity, unit, price_mode, total_price, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        start_time, quantity, unit, price_mode, total_price, points_earned, payment_method, remark, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [id, userOpenid, partnerProfileId, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
         String(body.partnerAvatarUrl || '').slice(0, 512), body.partnerGender === 'male' ? 'male' : 'female', String(body.partnerRankText || '').slice(0, 32),
         body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
-        Number(body.totalPrice), body.paymentMethod, body.remark || '']
+        Number(body.totalPrice), pointsEarned, body.paymentMethod, body.remark || '']
     );
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
     send(res, 0, { order: orderRow(order) });
