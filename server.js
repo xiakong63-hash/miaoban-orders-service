@@ -39,21 +39,35 @@ function formatDate(value) {
 function orderRow(row) {
   return {
     id: row.id,
+    partnerProfileId: row.partner_profile_id ? Number(row.partner_profile_id) : null,
     partnerName: row.partner_name,
     partnerTag: row.partner_tag,
     partnerInitial: row.partner_initial,
     partnerColor: row.partner_color,
+    partnerAvatarUrl: row.partner_avatar_url || '',
+    partnerGender: row.partner_gender === 'male' ? 'male' : 'female',
+    partnerRankText: row.partner_rank_text || '',
     service: row.service,
     startTime: row.start_time,
     quantity: row.quantity,
     unit: row.unit,
     priceMode: row.price_mode,
     totalPrice: Number(row.total_price),
+    pointsEarned: Number(row.points_earned || 0),
     paymentMethod: row.payment_method,
     remark: row.remark,
     status: row.status,
+    serviceStartedAt: formatDate(row.service_started_at),
+    serviceCompletedAt: formatDate(row.service_completed_at),
     createdAt: formatDate(row.created_at)
   };
+}
+
+function earlySettlementNotice(serviceSeconds, unit) {
+  if (unit !== '小时') return '已按原订单服务费用结算';
+  if (serviceSeconds < 35 * 60) return '服务不足 35 分钟，已按 30 分钟服务费用结算';
+  if (serviceSeconds < 65 * 60) return '服务不足 1 小时 5 分钟，已按 1 小时服务费用结算';
+  return '已按原订单服务费用结算';
 }
 
 function profileRow(row, openid) {
@@ -173,7 +187,9 @@ app.get('/api/profile', async (req, res) => {
     const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [userOpenid]);
     const [[stats]] = await pool.query(
       `SELECT COUNT(*) AS orderCount, SUM(status = 'pending') AS pendingCount,
-       SUM(status = 'completed') AS completedCount FROM orders WHERE openid = ?`,
+       SUM(status = 'completed') AS completedCount,
+       COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN points_earned ELSE 0 END), 0) AS pointsBalance
+       FROM orders WHERE openid = ?`,
       [userOpenid]
     );
     send(res, 0, {
@@ -181,7 +197,8 @@ app.get('/api/profile', async (req, res) => {
       stats: {
         orderCount: Number(stats.orderCount || 0),
         pendingCount: Number(stats.pendingCount || 0),
-        completedCount: Number(stats.completedCount || 0)
+        completedCount: Number(stats.completedCount || 0),
+        pointsBalance: Number(stats.pointsBalance || 0)
       }
     });
   } catch (error) {
@@ -224,6 +241,96 @@ app.get('/api/partner/me', async (req, res) => {
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '陪陪资料读取失败');
+  }
+});
+
+async function requireApprovedPartner(req, res) {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return null;
+  const [[partner]] = await pool.query("SELECT * FROM partner_profiles WHERE openid = ? AND status = 'approved'", [userOpenid]);
+  if (!partner) { send(res, 4031, null, '仅已通过审核的陪玩可使用接单大厅'); return null; }
+  return partner;
+}
+
+app.get('/api/partner/orders', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [rows] = await pool.query("SELECT * FROM orders WHERE partner_profile_id = ? AND status IN ('pending', 'progress') ORDER BY created_at DESC", [partner.id]);
+    send(res, 0, { orders: rows.map(orderRow) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '接单大厅读取失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/accept', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query("UPDATE orders SET status = 'progress' WHERE id = ? AND partner_profile_id = ? AND status = 'pending'", [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单已被处理或不存在');
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '接单失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/start', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query("UPDATE orders SET service_started_at = NOW() WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NULL", [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单未接单、已开始或不存在');
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '开始计时失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/complete', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query(`
+      UPDATE orders
+      SET status = 'completed',
+          service_completed_at = NOW(),
+          points_earned = GREATEST(0, FLOOR(CASE
+            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 35 * 60
+              THEN total_price / NULLIF(quantity, 0) * 0.5
+            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 65 * 60
+              THEN total_price / NULLIF(quantity, 0)
+            ELSE total_price
+          END)),
+          total_price = CASE
+            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 35 * 60
+              THEN ROUND(total_price / NULLIF(quantity, 0) * 0.5, 2)
+            WHEN unit = '小时' AND TIMESTAMPDIFF(SECOND, service_started_at, NOW()) < 65 * 60
+              THEN ROUND(total_price / NULLIF(quantity, 0), 2)
+            ELSE total_price
+          END
+      WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NOT NULL
+    `, [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单尚未开始、已结算或不存在');
+    const [[order]] = await pool.query(`
+      SELECT *, TIMESTAMPDIFF(SECOND, service_started_at, service_completed_at) AS service_seconds
+      FROM orders WHERE id = ? AND partner_profile_id = ?
+    `, [req.params.id, partner.id]);
+    send(res, 0, {
+      order: orderRow(order),
+      settlement: {
+        serviceSeconds: Number(order.service_seconds || 0),
+        message: earlySettlementNotice(Number(order.service_seconds || 0), order.unit)
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '订单结算失败');
   }
 });
 
@@ -322,6 +429,22 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
+app.get('/api/points', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, partner_name, service, total_price, points_earned, status, created_at FROM orders WHERE openid = ? AND status <> 'cancelled' AND points_earned > 0 ORDER BY created_at DESC LIMIT 100",
+      [userOpenid]
+    );
+    const balance = rows.reduce((total, item) => total + Number(item.points_earned || 0), 0);
+    send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, partnerName: item.partner_name || '陪陪订单', service: item.service || '', amount: Number(item.total_price || 0), points: Number(item.points_earned || 0), createdAt: formatDate(item.created_at) })) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '积分记录读取失败');
+  }
+});
+
 app.post('/api/orders', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
@@ -329,15 +452,23 @@ app.post('/api/orders', async (req, res) => {
   const required = ['partnerName', 'startTime', 'quantity', 'unit', 'priceMode', 'totalPrice', 'paymentMethod'];
   if (required.some((key) => body[key] === undefined || body[key] === '')) return send(res, 4002, null, '订单信息不完整');
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  const pointsEarned = Math.max(0, Math.floor(Number(body.totalPrice) || 0));
   try {
     await ensureUser(userOpenid);
+    const requestedPartnerId = Number(body.partnerId);
+    let partnerProfileId = null;
+    if (Number.isInteger(requestedPartnerId) && requestedPartnerId > 0) {
+      const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
+      if (partner) partnerProfileId = partner.id;
+    }
     await pool.query(
-      `INSERT INTO orders (id, openid, partner_name, partner_tag, partner_initial, partner_color, service,
-        start_time, quantity, unit, price_mode, total_price, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [id, userOpenid, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
+      `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
+        start_time, quantity, unit, price_mode, total_price, points_earned, payment_method, remark, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [id, userOpenid, partnerProfileId, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
+        String(body.partnerAvatarUrl || '').slice(0, 512), body.partnerGender === 'male' ? 'male' : 'female', String(body.partnerRankText || '').slice(0, 32),
         body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
-        Number(body.totalPrice), body.paymentMethod, body.remark || '']
+        Number(body.totalPrice), pointsEarned, body.paymentMethod, body.remark || '']
     );
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
     send(res, 0, { order: orderRow(order) });
