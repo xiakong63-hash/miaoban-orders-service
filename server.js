@@ -58,6 +58,7 @@ function orderRow(row) {
     remark: row.remark,
     status: row.status,
     serviceStartedAt: formatDate(row.service_started_at),
+    serviceCompletedAt: formatDate(row.service_completed_at),
     createdAt: formatDate(row.created_at)
   };
 }
@@ -281,6 +282,20 @@ app.patch('/api/partner/orders/:id/start', async (req, res) => {
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '开始计时失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/complete', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query("UPDATE orders SET status = 'completed', service_completed_at = NOW() WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NOT NULL", [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单尚未开始、已结算或不存在');
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '订单结算失败');
   }
 });
 
