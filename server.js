@@ -56,7 +56,7 @@ function orderRow(row) {
     originalTotalPrice: row.original_total_price === undefined || row.original_total_price === null ? Number(row.total_price) : Number(row.original_total_price),
     catFoodUsed: Number(row.cat_food_used || 0),
     couponDiscount: Number(row.coupon_discount || 0),
-    renewFromOrderId: row.renew_from_order_id || '',
+    renewFromOrderId: row.renew_from_order_id || ((String(row.remark || '').match(/续自订单\s+(MB[A-Z0-9]+)/) || [])[1] || ''),
     pointsEarned: Number(row.points_earned || 0),
     paymentMethod: row.payment_method,
     remark: row.remark,
@@ -632,10 +632,10 @@ app.post('/api/orders/:id/renew', async (req, res) => {
     await connection.beginTransaction();
     await connection.query(
       `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
-        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, points_earned, payment_method, remark, status, renew_from_order_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '立即开始', ?, ?, ?, ?, ?, 0, 0, NULL, 0, ?, ?, 'pending', ?)`,
+        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, points_earned, payment_method, remark, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '立即开始', ?, ?, ?, ?, ?, 0, 0, NULL, 0, ?, ?, 'pending')`,
       [id, userOpenid, source.partner_profile_id, source.partner_name, source.partner_tag, source.partner_initial, source.partner_color, source.partner_avatar_url, source.partner_gender, source.partner_rank_text, source.service,
-        quantity, renewUnit, renewUnit === '局' ? 'game' : 'hour', totalPrice, totalPrice, source.payment_method, `续自订单 ${source.id} · 按${renewUnit}续单`, source.id]
+        quantity, renewUnit, renewUnit === '局' ? 'game' : 'hour', totalPrice, totalPrice, source.payment_method, `续自订单 ${source.id} · 按${renewUnit}续单`]
     );
     await connection.commit();
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
