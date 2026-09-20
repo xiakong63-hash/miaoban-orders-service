@@ -489,14 +489,16 @@ app.post('/api/wallet/withdrawals', async (req, res) => {
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
-    await ensureWallet(connection, userOpenid);
+    const walletBefore = await ensureWallet(connection, userOpenid);
+    const balanceBefore = money(walletBefore.coin_balance);
     const [result] = await connection.query('UPDATE user_wallets SET coin_balance = coin_balance - ? WHERE openid = ? AND coin_balance >= ?', [amount, userOpenid, amount]);
     if (!result.affectedRows) { await connection.rollback(); return send(res, 4002, null, '金币余额不足'); }
-    await connection.query("INSERT INTO withdrawal_requests (openid, amount, status) VALUES (?, ?, 'pending')", [userOpenid, amount]);
+    const balanceAfter = money(balanceBefore - amount);
+    await connection.query("INSERT INTO withdrawal_requests (openid, amount, balance_before, balance_after, status) VALUES (?, ?, ?, ?, 'pending')", [userOpenid, amount, balanceBefore, balanceAfter]);
     await addWalletRecord(connection, userOpenid, { coinDelta: -amount, type: 'withdrawal', title: '提现申请（待处理）', amount });
     await connection.commit();
     const wallet = await ensureWallet(pool, userOpenid);
-    send(res, 0, { balance: money(wallet.coin_balance), message: '提现申请已提交，客服审核后将为你处理。' });
+    send(res, 0, { balance: money(wallet.coin_balance), balanceBefore, balanceAfter, message: '提现申请已提交，客服审核后将为你处理。' });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '提现申请失败'); }
   finally { if (connection) connection.release(); }
 });
@@ -599,7 +601,7 @@ app.get('/api/admin/withdrawals', async (req, res) => {
   try {
     const [rows] = await pool.query(`SELECT w.*, u.user_no, u.nick_name FROM withdrawal_requests w
       LEFT JOIN users u ON u.openid = w.openid ORDER BY FIELD(w.status, 'pending', 'approved', 'paid', 'rejected'), w.created_at DESC LIMIT 100`);
-    send(res, 0, { withdrawals: rows.map((row) => ({ id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', amount: money(row.amount), status: row.status, createdAt: formatDate(row.created_at) })) });
+    send(res, 0, { withdrawals: rows.map((row) => ({ id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })) });
   } catch (error) { console.error(error); send(res, 5001, null, '提现审核列表读取失败'); }
 });
 
@@ -679,8 +681,10 @@ app.get('/api/admin/users', async (req, res) => {
     const [[totalRow]] = await pool.query(`SELECT COUNT(*) AS total FROM users u ${where}`, params);
     const [rows] = await pool.query(
       `SELECT u.openid, u.user_no, u.nick_name, u.avatar_url, u.gender, u.birth_date, u.bio, u.created_at, u.last_login_at,
-       COUNT(o.id) AS order_count, COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total_price ELSE 0 END), 0) AS total_spent
-       FROM users u LEFT JOIN orders o ON u.openid = o.openid ${where}
+       COUNT(o.id) AS order_count, COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total_price ELSE 0 END), 0) AS total_spent,
+       MAX(COALESCE(w.coin_balance, 268)) AS coin_balance,
+       COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.points_earned ELSE 0 END), 0) + MAX(COALESCE(w.cat_food_balance, 0)) AS cat_food_balance
+       FROM users u LEFT JOIN orders o ON u.openid = o.openid LEFT JOIN user_wallets w ON u.openid = w.openid ${where}
        GROUP BY u.openid ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [...params, pageSize, (page - 1) * pageSize]
     );
@@ -690,7 +694,7 @@ app.get('/api/admin/users', async (req, res) => {
         openid: row.openid, registrationNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', gender: row.gender || '未知',
         birthDate: row.birth_date ? String(row.birth_date).slice(0, 10) : '', bio: row.bio || '',
         createdAt: formatDate(row.created_at), lastLoginAt: formatDate(row.last_login_at),
-        orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0)
+        orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0), coinBalance: money(row.coin_balance), catFoodBalance: Number(row.cat_food_balance || 0), couponBalance: 0
       }))
     });
   } catch (error) {
