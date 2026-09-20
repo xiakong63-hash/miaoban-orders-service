@@ -618,8 +618,8 @@ app.post('/api/orders/:id/renew', async (req, res) => {
   if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) return send(res, 4002, null, '请输入有效的续单数量');
   let connection;
   try {
-    const [[source]] = await pool.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND status IN ('progress', 'completed')", [req.params.id, userOpenid]);
-    if (!source) return send(res, 4004, null, '仅服务中或已完成订单可以续单');
+    const [[source]] = await pool.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND status = 'progress' AND service_completed_at IS NULL", [req.params.id, userOpenid]);
+    if (!source) return send(res, 4004, null, '仅未结束的进行中订单可以续单');
     const renewUnit = requestedUnit;
     const maxQuantity = renewUnit === '局' ? 99 : 24;
     const quantity = Math.min(requestedQuantity, maxQuantity);
