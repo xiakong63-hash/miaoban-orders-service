@@ -39,6 +39,7 @@ function formatDate(value) {
 function orderRow(row) {
   return {
     id: row.id,
+    partnerProfileId: row.partner_profile_id ? Number(row.partner_profile_id) : null,
     partnerName: row.partner_name,
     partnerTag: row.partner_tag,
     partnerInitial: row.partner_initial,
@@ -230,6 +231,40 @@ app.get('/api/partner/me', async (req, res) => {
   }
 });
 
+async function requireApprovedPartner(req, res) {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return null;
+  const [[partner]] = await pool.query("SELECT * FROM partner_profiles WHERE openid = ? AND status = 'approved'", [userOpenid]);
+  if (!partner) { send(res, 4031, null, '仅已通过审核的陪玩可使用接单大厅'); return null; }
+  return partner;
+}
+
+app.get('/api/partner/orders', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [rows] = await pool.query("SELECT * FROM orders WHERE partner_profile_id = ? AND status IN ('pending', 'progress') ORDER BY created_at DESC", [partner.id]);
+    send(res, 0, { orders: rows.map(orderRow) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '接单大厅读取失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/accept', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query("UPDATE orders SET status = 'progress' WHERE id = ? AND partner_profile_id = ? AND status = 'pending'", [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单已被处理或不存在');
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '接单失败');
+  }
+});
+
 app.post('/api/partner/apply', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
@@ -334,11 +369,17 @@ app.post('/api/orders', async (req, res) => {
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
   try {
     await ensureUser(userOpenid);
+    const requestedPartnerId = Number(body.partnerId);
+    let partnerProfileId = null;
+    if (Number.isInteger(requestedPartnerId) && requestedPartnerId > 0) {
+      const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
+      if (partner) partnerProfileId = partner.id;
+    }
     await pool.query(
-      `INSERT INTO orders (id, openid, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
+      `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
         start_time, quantity, unit, price_mode, total_price, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [id, userOpenid, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [id, userOpenid, partnerProfileId, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
         String(body.partnerAvatarUrl || '').slice(0, 512), body.partnerGender === 'male' ? 'male' : 'female', String(body.partnerRankText || '').slice(0, 32),
         body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
         Number(body.totalPrice), body.paymentMethod, body.remark || '']
