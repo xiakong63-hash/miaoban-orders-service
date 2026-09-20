@@ -581,15 +581,54 @@ app.get('/api/admin/summary', async (req, res) => {
     const [[partners]] = await pool.query(
       "SELECT COUNT(*) AS totalPartners, SUM(status = 'pending') AS pendingPartners, SUM(status = 'approved') AS approvedPartners FROM partner_profiles"
     );
+    const [[withdrawals]] = await pool.query("SELECT COUNT(*) AS pendingWithdrawals FROM withdrawal_requests WHERE status = 'pending'");
     send(res, 0, {
       totalUsers: Number(users.totalUsers || 0), todayNew: Number(users.todayNew || 0), weekNew: Number(users.weekNew || 0),
       orderCount: Number(orders.orderCount || 0), pendingCount: Number(orders.pendingCount || 0), revenue: Number(orders.revenue || 0),
-      totalPartners: Number(partners.totalPartners || 0), pendingPartners: Number(partners.pendingPartners || 0), approvedPartners: Number(partners.approvedPartners || 0)
+      totalPartners: Number(partners.totalPartners || 0), pendingPartners: Number(partners.pendingPartners || 0), approvedPartners: Number(partners.approvedPartners || 0),
+      pendingWithdrawals: Number(withdrawals.pendingWithdrawals || 0)
     });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '运营数据读取失败');
   }
+});
+
+app.get('/api/admin/withdrawals', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const [rows] = await pool.query(`SELECT w.*, u.user_no, u.nick_name FROM withdrawal_requests w
+      LEFT JOIN users u ON u.openid = w.openid ORDER BY FIELD(w.status, 'pending', 'approved', 'paid', 'rejected'), w.created_at DESC LIMIT 100`);
+    send(res, 0, { withdrawals: rows.map((row) => ({ id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', amount: money(row.amount), status: row.status, createdAt: formatDate(row.created_at) })) });
+  } catch (error) { console.error(error); send(res, 5001, null, '提现审核列表读取失败'); }
+});
+
+app.patch('/api/admin/withdrawals/:id/status', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  const status = String((req.body || {}).status || '');
+  if (!Number.isInteger(id) || id <= 0 || !['approved', 'rejected', 'paid'].includes(status)) return send(res, 4002, null, '审核状态无效');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[withdrawal]] = await connection.query('SELECT * FROM withdrawal_requests WHERE id = ? FOR UPDATE', [id]);
+    if (!withdrawal) { await connection.rollback(); return send(res, 4004, null, '提现申请不存在'); }
+    if (status === 'rejected') {
+      if (withdrawal.status !== 'pending') { await connection.rollback(); return send(res, 4002, null, '仅审核中的申请可以驳回'); }
+      await ensureWallet(connection, withdrawal.openid);
+      await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ? WHERE openid = ?', [withdrawal.amount, withdrawal.openid]);
+      await addWalletRecord(connection, withdrawal.openid, { coinDelta: withdrawal.amount, type: 'withdrawal_rejected', title: '提现驳回返还金币', amount: withdrawal.amount });
+    } else if (status === 'approved' && withdrawal.status !== 'pending') {
+      await connection.rollback(); return send(res, 4002, null, '仅审核中的申请可以通过');
+    } else if (status === 'paid' && withdrawal.status !== 'approved') {
+      await connection.rollback(); return send(res, 4002, null, '请先通过审核后再标记已打款');
+    }
+    await connection.query('UPDATE withdrawal_requests SET status = ? WHERE id = ?', [status, id]);
+    await connection.commit();
+    send(res, 0, { id, status });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '提现审核处理失败'); }
+  finally { if (connection) connection.release(); }
 });
 
 app.get('/api/admin/partners', async (req, res) => {
