@@ -605,6 +605,18 @@ app.get('/api/admin/withdrawals', async (req, res) => {
   } catch (error) { console.error(error); send(res, 5001, null, '提现审核列表读取失败'); }
 });
 
+app.get('/api/admin/withdrawals/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '提现申请无效');
+  try {
+    const [[row]] = await pool.query(`SELECT w.*, u.user_no, u.nick_name, u.avatar_url FROM withdrawal_requests w
+      LEFT JOIN users u ON u.openid = w.openid WHERE w.id = ?`, [id]);
+    if (!row) return send(res, 4004, null, '提现申请不存在');
+    send(res, 0, { withdrawal: { id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at), updatedAt: formatDate(row.updated_at) } });
+  } catch (error) { console.error(error); send(res, 5001, null, '提现详情读取失败'); }
+});
+
 app.patch('/api/admin/withdrawals/:id/status', async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const id = Number(req.params.id);
@@ -701,6 +713,32 @@ app.get('/api/admin/users', async (req, res) => {
     console.error(error);
     send(res, 5001, null, '用户列表读取失败');
   }
+});
+
+app.get('/api/admin/users/:openid/detail', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const openid = String(req.params.openid || '').trim();
+  if (!openid) return send(res, 4002, null, '用户标识无效');
+  try {
+    const [[user]] = await pool.query('SELECT * FROM users WHERE openid = ?', [openid]);
+    if (!user) return send(res, 4004, null, '用户不存在');
+    const wallet = await ensureWallet(pool, openid);
+    const [orders] = await pool.query('SELECT * FROM orders WHERE openid = ? ORDER BY created_at DESC LIMIT 200', [openid]);
+    const [withdrawals] = await pool.query('SELECT * FROM withdrawal_requests WHERE openid = ? ORDER BY created_at DESC LIMIT 100', [openid]);
+    const [walletRecords] = await pool.query('SELECT * FROM wallet_transactions WHERE openid = ? ORDER BY created_at DESC LIMIT 200', [openid]);
+    const catFoodFromOrders = orders.filter((row) => row.status !== 'cancelled').reduce((total, row) => total + Number(row.points_earned || 0), 0);
+    send(res, 0, {
+      user: {
+        openid: user.openid, registrationNo: user.user_no || '', nickName: user.nick_name || '未完善资料用户', avatarUrl: user.avatar_url || '', gender: user.gender || '未知',
+        birthDate: user.birth_date ? String(user.birth_date).slice(0, 10) : '', bio: user.bio || '', createdAt: formatDate(user.created_at), lastLoginAt: formatDate(user.last_login_at),
+        coinBalance: money(wallet.coin_balance), catFoodBalance: catFoodFromOrders + Number(wallet.cat_food_balance || 0), couponBalance: 0
+      },
+      orders: orders.map(orderRow),
+      withdrawals: withdrawals.map((row) => ({ id: Number(row.id), amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })),
+      walletRecords: walletRecords.map((row) => ({ id: Number(row.id), title: row.title, transactionType: row.transaction_type, coinDelta: money(row.coin_delta), catFoodDelta: Number(row.cat_food_delta || 0), amount: money(row.amount), orderId: row.order_id || '', createdAt: formatDate(row.created_at) })),
+      lotteryRecords: []
+    });
+  } catch (error) { console.error(error); send(res, 5001, null, '用户详情读取失败'); }
 });
 
 app.use((error, req, res, next) => {
