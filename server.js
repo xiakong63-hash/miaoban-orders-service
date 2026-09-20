@@ -57,6 +57,7 @@ function orderRow(row) {
     paymentMethod: row.payment_method,
     remark: row.remark,
     status: row.status,
+    serviceStartedAt: formatDate(row.service_started_at),
     createdAt: formatDate(row.created_at)
   };
 }
@@ -266,6 +267,20 @@ app.patch('/api/partner/orders/:id/accept', async (req, res) => {
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '接单失败');
+  }
+});
+
+app.patch('/api/partner/orders/:id/start', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    const [result] = await pool.query("UPDATE orders SET service_started_at = NOW() WHERE id = ? AND partner_profile_id = ? AND status = 'progress' AND service_started_at IS NULL", [req.params.id, partner.id]);
+    if (!result.affectedRows) return send(res, 4004, null, '订单未接单、已开始或不存在');
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '开始计时失败');
   }
 });
 
