@@ -53,6 +53,9 @@ function orderRow(row) {
     unit: row.unit,
     priceMode: row.price_mode,
     totalPrice: Number(row.total_price),
+    originalTotalPrice: row.original_total_price === undefined || row.original_total_price === null ? Number(row.total_price) : Number(row.original_total_price),
+    catFoodUsed: Number(row.cat_food_used || 0),
+    couponDiscount: Number(row.coupon_discount || 0),
     pointsEarned: Number(row.points_earned || 0),
     paymentMethod: row.payment_method,
     remark: row.remark,
@@ -213,14 +216,16 @@ app.get('/api/profile', async (req, res) => {
       [userOpenid]
     );
     const wallet = await ensureWallet(pool, userOpenid);
+    const [[couponStats]] = await pool.query("SELECT COUNT(*) AS couponCount FROM user_coupons WHERE openid = ? AND status = 'unused'", [userOpenid]);
     send(res, 0, {
       profile: profileRow(user, userOpenid),
       stats: {
         orderCount: Number(stats.orderCount || 0),
         pendingCount: Number(stats.pendingCount || 0),
         completedCount: Number(stats.completedCount || 0),
-        pointsBalance: Number(stats.pointsBalance || 0) + Number(wallet.cat_food_balance || 0),
-        coinBalance: money(wallet.coin_balance)
+        pointsBalance: Number(wallet.cat_food_balance || 0),
+        coinBalance: money(wallet.coin_balance),
+        couponCount: Number(couponStats.couponCount || 0)
       }
     });
   } catch (error) {
@@ -330,13 +335,14 @@ app.patch('/api/partner/orders/:id/complete', async (req, res) => {
     if (current.unit === '小时' && serviceSeconds < 35 * 60) settledPrice = money(originalPrice / Number(current.quantity) * 0.5);
     else if (current.unit === '小时' && serviceSeconds < 65 * 60) settledPrice = money(originalPrice / Number(current.quantity));
     const refundCoins = money(Math.max(0, originalPrice - settledPrice));
-    const catFood = Math.max(0, Math.floor(settledPrice));
+    const catFood = Math.max(0, Math.floor(settledPrice * 0.3));
     await connection.query("UPDATE orders SET status = 'completed', service_completed_at = NOW(), total_price = ?, points_earned = ? WHERE id = ?", [settledPrice, catFood, current.id]);
+    await ensureWallet(connection, current.openid);
+    await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance + ? WHERE openid = ?', [refundCoins, catFood, current.openid]);
     if (refundCoins > 0) {
-      await ensureWallet(connection, current.openid);
-      await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ? WHERE openid = ?', [refundCoins, current.openid]);
       await addWalletRecord(connection, current.openid, { coinDelta: refundCoins, type: 'early_settlement_refund', title: '提前结单返还金币', amount: refundCoins, orderId: current.id });
     }
+    if (catFood > 0) await addWalletRecord(connection, current.openid, { catFoodDelta: catFood, type: 'order_cat_food', title: '订单消费赠送猫粮', amount: settledPrice, orderId: current.id });
     await connection.commit();
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND partner_profile_id = ?', [req.params.id, partner.id]);
     send(res, 0, {
@@ -465,6 +471,37 @@ app.get('/api/wallet', async (req, res) => {
   } catch (error) { console.error(error); send(res, 5001, null, '金币钱包读取失败'); }
 });
 
+app.get('/api/coupons', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const wallet = await ensureWallet(pool, userOpenid);
+    const [coupons] = await pool.query("SELECT * FROM user_coupons WHERE openid = ? AND status = 'unused' ORDER BY amount ASC, created_at DESC", [userOpenid]);
+    send(res, 0, { catFoodBalance: Number(wallet.cat_food_balance || 0), coupons: coupons.map((row) => ({ id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost), name: `¥${money(row.amount)} 猫粮兑换券`, createdAt: formatDate(row.created_at) })) });
+  } catch (error) { console.error(error); send(res, 5001, null, '优惠券读取失败'); }
+});
+
+app.post('/api/coupons/exchange', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const amount = money(req.body && req.body.amount);
+  const costs = { 3: 30, 5: 50, 10: 100 };
+  if (!Object.prototype.hasOwnProperty.call(costs, amount)) return send(res, 4002, null, '请选择有效优惠券面额');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    await ensureWallet(connection, userOpenid);
+    const [result] = await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance - ? WHERE openid = ? AND cat_food_balance >= ?', [costs[amount], userOpenid, costs[amount]]);
+    if (!result.affectedRows) { await connection.rollback(); return send(res, 4002, null, '猫粮余额不足'); }
+    const [couponResult] = await connection.query("INSERT INTO user_coupons (openid, amount, cat_food_cost, status) VALUES (?, ?, ?, 'unused')", [userOpenid, amount, costs[amount]]);
+    await addWalletRecord(connection, userOpenid, { catFoodDelta: -costs[amount], type: 'coupon_exchange', title: `兑换 ¥${amount} 优惠券`, amount });
+    await connection.commit();
+    send(res, 0, { coupon: { id: Number(couponResult.insertId), amount, catFoodCost: costs[amount] } });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '优惠券兑换失败'); }
+  finally { if (connection) connection.release(); }
+});
+
 app.post('/api/wallet/recharge', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
@@ -512,7 +549,7 @@ app.get('/api/points', async (req, res) => {
       [userOpenid]
     );
     const wallet = await ensureWallet(pool, userOpenid);
-    const balance = rows.reduce((total, item) => total + Number(item.points_earned || 0), 0) + Number(wallet.cat_food_balance || 0);
+    const balance = Number(wallet.cat_food_balance || 0);
     send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, partnerName: item.partner_name || '陪陪订单', service: item.service || '', amount: Number(item.total_price || 0), points: Number(item.points_earned || 0), createdAt: formatDate(item.created_at) })) });
   } catch (error) {
     console.error(error);
@@ -527,7 +564,10 @@ app.post('/api/orders', async (req, res) => {
   const required = ['partnerName', 'startTime', 'quantity', 'unit', 'priceMode', 'totalPrice', 'paymentMethod'];
   if (required.some((key) => body[key] === undefined || body[key] === '')) return send(res, 4002, null, '订单信息不完整');
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
-  const pointsEarned = Math.max(0, Math.floor(Number(body.totalPrice) || 0));
+  const originalTotalPrice = money(body.totalPrice);
+  const couponId = Number(body.couponId);
+  const pointsEarned = 0;
+  let connection;
   try {
     await ensureUser(userOpenid);
     const requestedPartnerId = Number(body.partnerId);
@@ -536,20 +576,36 @@ app.post('/api/orders', async (req, res) => {
       const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
       if (partner) partnerProfileId = partner.id;
     }
-    await pool.query(
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    let coupon = null;
+    if (Number.isInteger(couponId) && couponId > 0) {
+      const [[row]] = await connection.query("SELECT * FROM user_coupons WHERE id = ? AND openid = ? AND status = 'unused' FOR UPDATE", [couponId, userOpenid]);
+      if (!row) { await connection.rollback(); return send(res, 4002, null, '优惠券不可用或已使用'); }
+      coupon = row;
+    }
+    const couponDiscount = money(Math.min(originalTotalPrice, coupon ? coupon.amount : 0));
+    const totalPrice = money(originalTotalPrice - couponDiscount);
+    const catFoodUsed = coupon ? Number(coupon.cat_food_cost || 0) : 0;
+    await connection.query(
       `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
-        start_time, quantity, unit, price_mode, total_price, points_earned, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, points_earned, payment_method, remark, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [id, userOpenid, partnerProfileId, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
         String(body.partnerAvatarUrl || '').slice(0, 512), body.partnerGender === 'male' ? 'male' : 'female', String(body.partnerRankText || '').slice(0, 32),
         body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
-        Number(body.totalPrice), pointsEarned, body.paymentMethod, body.remark || '']
+        totalPrice, originalTotalPrice, catFoodUsed, couponDiscount, coupon ? coupon.id : null, pointsEarned, body.paymentMethod, body.remark || '']
     );
+    if (coupon) await connection.query("UPDATE user_coupons SET status = 'used', used_order_id = ?, used_at = NOW() WHERE id = ?", [id, coupon.id]);
+    await connection.commit();
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
     send(res, 0, { order: orderRow(order) });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error(error);
     send(res, 5001, null, '订单创建失败');
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -695,7 +751,8 @@ app.get('/api/admin/users', async (req, res) => {
       `SELECT u.openid, u.user_no, u.nick_name, u.avatar_url, u.gender, u.birth_date, u.bio, u.created_at, u.last_login_at,
        COUNT(o.id) AS order_count, COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total_price ELSE 0 END), 0) AS total_spent,
        MAX(COALESCE(w.coin_balance, 268)) AS coin_balance,
-       COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.points_earned ELSE 0 END), 0) + MAX(COALESCE(w.cat_food_balance, 0)) AS cat_food_balance
+       MAX(COALESCE(w.cat_food_balance, 0)) AS cat_food_balance,
+       (SELECT COUNT(*) FROM user_coupons c WHERE c.openid = u.openid AND c.status = 'unused') AS coupon_balance
        FROM users u LEFT JOIN orders o ON u.openid = o.openid LEFT JOIN user_wallets w ON u.openid = w.openid ${where}
        GROUP BY u.openid ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [...params, pageSize, (page - 1) * pageSize]
@@ -706,7 +763,7 @@ app.get('/api/admin/users', async (req, res) => {
         openid: row.openid, registrationNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', gender: row.gender || '未知',
         birthDate: row.birth_date ? String(row.birth_date).slice(0, 10) : '', bio: row.bio || '',
         createdAt: formatDate(row.created_at), lastLoginAt: formatDate(row.last_login_at),
-        orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0), coinBalance: money(row.coin_balance), catFoodBalance: Number(row.cat_food_balance || 0), couponBalance: 0
+        orderCount: Number(row.order_count || 0), totalSpent: Number(row.total_spent || 0), coinBalance: money(row.coin_balance), catFoodBalance: Number(row.cat_food_balance || 0), couponBalance: Number(row.coupon_balance || 0)
       }))
     });
   } catch (error) {
@@ -726,16 +783,17 @@ app.get('/api/admin/users/:openid/detail', async (req, res) => {
     const [orders] = await pool.query('SELECT * FROM orders WHERE openid = ? ORDER BY created_at DESC LIMIT 200', [openid]);
     const [withdrawals] = await pool.query('SELECT * FROM withdrawal_requests WHERE openid = ? ORDER BY created_at DESC LIMIT 100', [openid]);
     const [walletRecords] = await pool.query('SELECT * FROM wallet_transactions WHERE openid = ? ORDER BY created_at DESC LIMIT 200', [openid]);
-    const catFoodFromOrders = orders.filter((row) => row.status !== 'cancelled').reduce((total, row) => total + Number(row.points_earned || 0), 0);
+    const [coupons] = await pool.query('SELECT * FROM user_coupons WHERE openid = ? ORDER BY created_at DESC LIMIT 100', [openid]);
     send(res, 0, {
       user: {
         openid: user.openid, registrationNo: user.user_no || '', nickName: user.nick_name || '未完善资料用户', avatarUrl: user.avatar_url || '', gender: user.gender || '未知',
         birthDate: user.birth_date ? String(user.birth_date).slice(0, 10) : '', bio: user.bio || '', createdAt: formatDate(user.created_at), lastLoginAt: formatDate(user.last_login_at),
-        coinBalance: money(wallet.coin_balance), catFoodBalance: catFoodFromOrders + Number(wallet.cat_food_balance || 0), couponBalance: 0
+        coinBalance: money(wallet.coin_balance), catFoodBalance: Number(wallet.cat_food_balance || 0), couponBalance: coupons.filter((row) => row.status === 'unused').length
       },
       orders: orders.map(orderRow),
       withdrawals: withdrawals.map((row) => ({ id: Number(row.id), amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })),
       walletRecords: walletRecords.map((row) => ({ id: Number(row.id), title: row.title, transactionType: row.transaction_type, coinDelta: money(row.coin_delta), catFoodDelta: Number(row.cat_food_delta || 0), amount: money(row.amount), orderId: row.order_id || '', createdAt: formatDate(row.created_at) })),
+      coupons: coupons.map((row) => ({ id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost), status: row.status, createdAt: formatDate(row.created_at), usedAt: formatDate(row.used_at) })),
       lotteryRecords: []
     });
   } catch (error) { console.error(error); send(res, 5001, null, '用户详情读取失败'); }
