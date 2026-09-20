@@ -43,6 +43,9 @@ function orderRow(row) {
     partnerTag: row.partner_tag,
     partnerInitial: row.partner_initial,
     partnerColor: row.partner_color,
+    partnerAvatarUrl: row.partner_avatar_url || '',
+    partnerGender: row.partner_gender === 'male' ? 'male' : 'female',
+    partnerRankText: row.partner_rank_text || '',
     service: row.service,
     startTime: row.start_time,
     quantity: row.quantity,
@@ -332,10 +335,11 @@ app.post('/api/orders', async (req, res) => {
   try {
     await ensureUser(userOpenid);
     await pool.query(
-      `INSERT INTO orders (id, openid, partner_name, partner_tag, partner_initial, partner_color, service,
+      `INSERT INTO orders (id, openid, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
         start_time, quantity, unit, price_mode, total_price, payment_method, remark, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [id, userOpenid, body.partnerName, body.partnerTag || '', body.partnerInitial || '', body.partnerColor || '',
+        String(body.partnerAvatarUrl || '').slice(0, 512), body.partnerGender === 'male' ? 'male' : 'female', String(body.partnerRankText || '').slice(0, 32),
         body.service || '', body.startTime, Number(body.quantity), body.unit, body.priceMode,
         Number(body.totalPrice), body.paymentMethod, body.remark || '']
     );
