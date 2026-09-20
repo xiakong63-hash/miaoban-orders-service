@@ -79,6 +79,7 @@ function partnerRow(row, includeOpenid) {
     initial: (row.display_name || '喵').slice(0, 1),
     gameName: row.game_name || '',
     game: row.game || '无畏契约',
+    gender: row.gender === 'male' ? 'male' : 'female',
     level: row.service_level || '娱乐',
     rankText: row.rank_text || '',
     description: row.description || '',
@@ -234,6 +235,7 @@ app.post('/api/partner/apply', async (req, res) => {
   const avatarUrl = String(body.avatarUrl || '').trim().slice(0, 512);
   const gameName = String(body.gameName || '').trim().slice(0, 32);
   const game = String(body.game || '无畏契约').trim().slice(0, 32);
+  const gender = body.gender === 'male' ? 'male' : (body.gender === 'female' ? 'female' : '');
   const level = ['娱乐', '娱技', '技术', '顶尖'].includes(body.level) ? body.level : '';
   const rankText = String(body.rankText || '').trim().slice(0, 32);
   const description = String(body.description || '').trim().slice(0, 160);
@@ -242,20 +244,20 @@ app.post('/api/partner/apply', async (req, res) => {
   const hourPrice = Number(body.hourPrice);
   const gamePrice = Number(body.gamePrice);
   const availableTime = String(body.availableTime || '').trim().slice(0, 80);
-  if (!displayName || !gameName || !level || !rankText || !description || !availableTime || !Number.isFinite(hourPrice) || hourPrice <= 0 || !Number.isFinite(gamePrice) || gamePrice <= 0) {
+  if (!displayName || !gameName || !gender || !level || !rankText || !description || !availableTime || !Number.isFinite(hourPrice) || hourPrice <= 0 || !Number.isFinite(gamePrice) || gamePrice <= 0) {
     return send(res, 4002, null, '请完整填写陪陪资料和价格');
   }
-  if ((audioUrl && (audioDuration < 1 || audioDuration > 12)) || (!audioUrl && audioDuration)) return send(res, 4002, null, '介绍语音时长需为 1 至 12 秒');
+  if (!audioUrl || audioDuration < 1 || audioDuration > 12) return send(res, 4002, null, '请录制 1 至 12 秒的介绍语音');
   try {
     await ensureUser(userOpenid);
     const partnerNo = await ensurePartnerNo(userOpenid);
     await pool.query(
-      `INSERT INTO partner_profiles (openid, partner_no, display_name, avatar_url, game_name, game, service_level, rank_text, description, audio_url, audio_duration, hour_price, game_price, available_time, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+      `INSERT INTO partner_profiles (openid, partner_no, display_name, avatar_url, game_name, game, gender, service_level, rank_text, description, audio_url, audio_duration, hour_price, game_price, available_time, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
        ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), avatar_url = VALUES(avatar_url), game_name = VALUES(game_name),
-       game = VALUES(game), service_level = VALUES(service_level), rank_text = VALUES(rank_text), description = VALUES(description),
+       game = VALUES(game), gender = VALUES(gender), service_level = VALUES(service_level), rank_text = VALUES(rank_text), description = VALUES(description),
        audio_url = VALUES(audio_url), audio_duration = VALUES(audio_duration), hour_price = VALUES(hour_price), game_price = VALUES(game_price), available_time = VALUES(available_time), status = 'pending'`,
-      [userOpenid, partnerNo, displayName, avatarUrl, gameName, game, level, rankText, description, audioUrl, audioDuration, hourPrice, gamePrice, availableTime]
+      [userOpenid, partnerNo, displayName, avatarUrl, gameName, game, gender, level, rankText, description, audioUrl, audioDuration, hourPrice, gamePrice, availableTime]
     );
     const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE openid = ?', [userOpenid]);
     send(res, 0, { partner: partnerRow(partner, false) });
@@ -304,6 +306,19 @@ app.get('/api/orders', async (req, res) => {
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '订单读取失败');
+  }
+});
+
+app.get('/api/orders/:id', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [req.params.id, userOpenid]);
+    if (!order) return send(res, 4004, null, '订单不存在或无权查看');
+    send(res, 0, { order: orderRow(order) });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '订单详情读取失败');
   }
 });
 
