@@ -477,8 +477,8 @@ app.get('/api/coupons', async (req, res) => {
   if (!userOpenid) return;
   try {
     const wallet = await ensureWallet(pool, userOpenid);
-    const [coupons] = await pool.query("SELECT * FROM user_coupons WHERE openid = ? AND status = 'unused' ORDER BY amount ASC, created_at DESC", [userOpenid]);
-    send(res, 0, { catFoodBalance: Number(wallet.cat_food_balance || 0), coupons: coupons.map((row) => ({ id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost), name: `¥${money(row.amount)} 猫粮兑换券`, createdAt: formatDate(row.created_at) })) });
+    const [coupons] = await pool.query("SELECT * FROM user_coupons WHERE openid = ? ORDER BY FIELD(status, 'unused', 'used', 'expired'), created_at DESC", [userOpenid]);
+    send(res, 0, { catFoodBalance: Number(wallet.cat_food_balance || 0), coupons: coupons.map((row) => ({ id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost), name: `¥${money(row.amount)} 猫粮兑换券`, status: row.status || 'unused', usedOrderId: row.used_order_id || '', createdAt: formatDate(row.created_at), usedAt: formatDate(row.used_at) })) });
   } catch (error) { console.error(error); send(res, 5001, null, '优惠券读取失败'); }
 });
 
@@ -660,6 +660,66 @@ app.patch('/api/orders/:id/cancel', async (req, res) => {
   }
 });
 
+app.post('/api/orders/:id/refund-direct-disabled', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[order]] = await connection.query(
+      "SELECT * FROM orders WHERE id = ? AND openid = ? AND status IN ('pending', 'progress', 'completed') FOR UPDATE",
+      [req.params.id, userOpenid]
+    );
+    if (!order) { await connection.rollback(); return send(res, 4004, null, '订单不存在、已取消或已退款'); }
+    const refundAmount = money(order.total_price);
+    const catFoodToDeduct = Math.max(0, Number(order.points_earned || 0));
+    await ensureWallet(connection, userOpenid);
+    const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [userOpenid]);
+    if (Number(wallet.cat_food_balance || 0) < catFoodToDeduct) {
+      await connection.rollback();
+      return send(res, 4002, null, `猫粮余额不足，需扣回 ${catFoodToDeduct} 猫粮后才能退款`);
+    }
+    await connection.query(
+      "UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?",
+      [` [已退款：¥${refundAmount}，扣回${catFoodToDeduct}猫粮]`, order.id]
+    );
+    await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance - ? WHERE openid = ?', [refundAmount, catFoodToDeduct, userOpenid]);
+    await addWalletRecord(connection, userOpenid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（返还金币、扣回猫粮）', amount: refundAmount, orderId: order.id });
+    await connection.commit();
+    const [[updatedOrder]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [order.id, userOpenid]);
+    send(res, 0, { order: orderRow(updatedOrder), refundAmount, catFoodToDeduct });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error(error);
+    send(res, 5001, null, '订单退款失败');
+  } finally { if (connection) connection.release(); }
+});
+
+app.post('/api/orders/:id/refund-requests', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const reason = String((req.body || {}).reason || '').trim().slice(0, 300);
+  const evidence = Array.isArray((req.body || {}).evidence) ? (req.body || {}).evidence.map((item) => String(item || '').slice(0, 512)).filter(Boolean).slice(0, 3) : [];
+  if (reason.length < 5) return send(res, 4002, null, '请填写至少 5 个字的退款理由');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[order]] = await connection.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND status <> 'cancelled' FOR UPDATE", [req.params.id, userOpenid]);
+    if (!order) { await connection.rollback(); return send(res, 4004, null, '订单不存在、已取消或已退款'); }
+    const [[existing]] = await connection.query("SELECT id FROM refund_requests WHERE order_id = ? AND status = 'pending' FOR UPDATE", [order.id]);
+    if (existing) { await connection.rollback(); return send(res, 4002, null, '该订单已有待处理退款申请'); }
+    const [result] = await connection.query("INSERT INTO refund_requests (order_id, openid, refund_amount, cat_food_to_deduct, reason, evidence_json, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')", [order.id, userOpenid, money(order.total_price), Math.max(0, Number(order.points_earned || 0)), reason, JSON.stringify(evidence)]);
+    await connection.commit();
+    send(res, 0, { id: Number(result.insertId), orderId: order.id, refundAmount: money(order.total_price), catFoodToDeduct: Math.max(0, Number(order.points_earned || 0)) });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error(error);
+    send(res, 5001, null, '退款申请提交失败');
+  } finally { if (connection) connection.release(); }
+});
+
 app.get('/api/admin/summary', async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
@@ -675,11 +735,13 @@ app.get('/api/admin/summary', async (req, res) => {
       "SELECT COUNT(*) AS totalPartners, SUM(status = 'pending') AS pendingPartners, SUM(status = 'approved') AS approvedPartners FROM partner_profiles"
     );
     const [[withdrawals]] = await pool.query("SELECT COUNT(*) AS pendingWithdrawals FROM withdrawal_requests WHERE status = 'pending'");
+    const [[refunds]] = await pool.query("SELECT COUNT(*) AS pendingRefunds FROM refund_requests WHERE status = 'pending'");
     send(res, 0, {
       totalUsers: Number(users.totalUsers || 0), todayNew: Number(users.todayNew || 0), weekNew: Number(users.weekNew || 0),
       orderCount: Number(orders.orderCount || 0), pendingCount: Number(orders.pendingCount || 0), revenue: Number(orders.revenue || 0),
       totalPartners: Number(partners.totalPartners || 0), pendingPartners: Number(partners.pendingPartners || 0), approvedPartners: Number(partners.approvedPartners || 0),
-      pendingWithdrawals: Number(withdrawals.pendingWithdrawals || 0)
+      pendingWithdrawals: Number(withdrawals.pendingWithdrawals || 0),
+      pendingRefunds: Number(refunds.pendingRefunds || 0)
     });
   } catch (error) {
     console.error(error);
@@ -733,6 +795,77 @@ app.patch('/api/admin/withdrawals/:id/status', async (req, res) => {
     await connection.commit();
     send(res, 0, { id, status });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '提现审核处理失败'); }
+  finally { if (connection) connection.release(); }
+});
+
+app.get('/api/admin/refund-requests', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const [rows] = await pool.query(`SELECT r.*, u.user_no, u.nick_name, u.avatar_url,
+      o.partner_name, o.payment_method, o.unit, o.quantity, o.total_price AS order_total_price,
+      o.service_started_at, o.service_completed_at
+      FROM refund_requests r
+      LEFT JOIN users u ON u.openid = r.openid
+      LEFT JOIN orders o ON o.id = r.order_id
+      ORDER BY FIELD(r.status, 'pending', 'approved', 'rejected', 'refunded'), r.created_at DESC LIMIT 100`);
+    send(res, 0, { refunds: rows.map((row) => {
+      let evidence = [];
+      try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
+      return {
+        id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '',
+        partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0),
+        orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0),
+        reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], status: row.status,
+        createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at), serviceStartedAt: formatDate(row.service_started_at), serviceCompletedAt: formatDate(row.service_completed_at)
+      };
+    }) });
+  } catch (error) { console.error(error); send(res, 5001, null, '退款审核列表读取失败'); }
+});
+
+app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
+  const reviewerOpenid = requireAdmin(req, res);
+  if (!reviewerOpenid) return;
+  const id = Number(req.params.id);
+  const status = String((req.body || {}).status || '');
+  const rejectReason = String((req.body || {}).reason || '').trim().slice(0, 300);
+  if (!Number.isInteger(id) || id <= 0 || !['approved', 'rejected'].includes(status)) return send(res, 4002, null, '退款审核状态无效');
+  if (status === 'rejected' && !rejectReason) return send(res, 4002, null, '请填写拒绝退款原因');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[refund]] = await connection.query('SELECT * FROM refund_requests WHERE id = ? FOR UPDATE', [id]);
+    if (!refund) { await connection.rollback(); return send(res, 4004, null, '退款申请不存在'); }
+    if (refund.status !== 'pending') { await connection.rollback(); return send(res, 4002, null, '该退款申请已处理'); }
+    if (status === 'rejected') {
+      await connection.query("UPDATE refund_requests SET status = 'rejected', reject_reason = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [rejectReason, reviewerOpenid, id]);
+      await connection.commit();
+      return send(res, 0, { id, status: 'rejected', rejectReason, notice: '拒绝原因已记录，请通过首页同一企微客服会话告知用户。' });
+    }
+    const [[order]] = await connection.query(`SELECT *, TIMESTAMPDIFF(SECOND, service_started_at, COALESCE(service_completed_at, NOW())) AS service_seconds
+      FROM orders WHERE id = ? AND openid = ? FOR UPDATE`, [refund.order_id, refund.openid]);
+    if (!order || order.status === 'cancelled') { await connection.rollback(); return send(res, 4004, null, '订单不存在或已退款'); }
+    let refundAmount = 0;
+    const seconds = Math.max(0, Number(order.service_seconds || 0));
+    if (order.unit === '小时') {
+      if (!order.service_started_at || seconds < 28 * 60) { await connection.rollback(); return send(res, 4002, null, '服务时长不足 28 分钟，不满足退款规则'); }
+      if (seconds > 60 * 60) { await connection.rollback(); return send(res, 4002, null, '服务时长已超过 1 小时，请人工协商处理'); }
+      const hourlyPrice = money(Number(order.original_total_price === null ? order.total_price : order.original_total_price) / Math.max(1, Number(order.quantity || 1)));
+      refundAmount = money(hourlyPrice * (seconds < 57 * 60 ? 0.5 : 1));
+    } else {
+      refundAmount = money(order.total_price);
+    }
+    const catFoodToDeduct = Math.max(0, Number(order.points_earned || 0));
+    await ensureWallet(connection, refund.openid);
+    const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [refund.openid]);
+    if (Number(wallet.cat_food_balance || 0) < catFoodToDeduct) { await connection.rollback(); return send(res, 4002, null, `用户猫粮余额不足，需扣回 ${catFoodToDeduct} 猫粮`); }
+    await connection.query("UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：¥${refundAmount}，原路退回（演示），扣回${catFoodToDeduct}猫粮]`, order.id]);
+    await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance - ? WHERE openid = ?', [refundAmount, catFoodToDeduct, refund.openid]);
+    await addWalletRecord(connection, refund.openid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（原路退款演示）', amount: refundAmount, orderId: order.id });
+    await connection.query("UPDATE refund_requests SET status = 'refunded', refund_amount = ?, cat_food_to_deduct = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [refundAmount, catFoodToDeduct, reviewerOpenid, id]);
+    await connection.commit();
+    send(res, 0, { id, status: 'refunded', refundAmount, catFoodToDeduct, refundRoute: order.payment_method || '原支付路径（演示）' });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '退款审核处理失败'); }
   finally { if (connection) connection.release(); }
 });
 
