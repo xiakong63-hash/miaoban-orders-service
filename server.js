@@ -722,15 +722,17 @@ app.post('/api/orders/:id/refund-requests', async (req, res) => {
 
 function refundRequestRow(row) {
   let evidence = [];
+  let rejectEvidence = [];
   try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
-  return { ...orderRow(row), refund: { id: Number(row.refund_id), status: row.refund_status, amount: money(row.refund_amount), reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], createdAt: formatDate(row.refund_created_at), reviewedAt: formatDate(row.reviewed_at), catFoodToDeduct: Number(row.cat_food_to_deduct || 0) } };
+  try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
+  return { ...orderRow(row), refund: { id: Number(row.refund_id), status: row.refund_status, amount: money(row.refund_amount), reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], createdAt: formatDate(row.refund_created_at), reviewedAt: formatDate(row.reviewed_at), catFoodToDeduct: Number(row.cat_food_to_deduct || 0) } };
 }
 
 app.get('/api/refund-requests', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   try {
-    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status IN ('pending', 'rejected', 'refunded') ORDER BY r.created_at DESC`, [userOpenid]);
+    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status IN ('pending', 'rejected', 'refunded') ORDER BY r.created_at DESC`, [userOpenid]);
     send(res, 0, { refunds: rows.map(refundRequestRow) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款订单读取失败'); }
 });
@@ -741,7 +743,7 @@ app.get('/api/refund-requests/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '退款申请无效');
   try {
-    const [[row]] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.id = ? AND r.openid = ?`, [id, userOpenid]);
+    const [[row]] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.id = ? AND r.openid = ?`, [id, userOpenid]);
     if (!row) return send(res, 4004, null, '退款申请不存在');
     send(res, 0, { refund: refundRequestRow(row) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款详情读取失败'); }
@@ -836,17 +838,32 @@ app.get('/api/admin/refund-requests', async (req, res) => {
       LEFT JOIN orders o ON o.id = r.order_id
       ORDER BY FIELD(r.status, 'pending', 'approved', 'rejected', 'refunded'), r.created_at DESC LIMIT 100`);
     send(res, 0, { refunds: rows.map((row) => {
-      let evidence = [];
+      let evidence = []; let rejectEvidence = [];
       try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
+      try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
       return {
         id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '',
         partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0),
         orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0),
-        reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], status: row.status,
+        reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status,
         createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at), serviceStartedAt: formatDate(row.service_started_at), serviceCompletedAt: formatDate(row.service_completed_at)
       };
     }) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款审核列表读取失败'); }
+});
+
+app.get('/api/admin/refund-requests/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '退款申请无效');
+  try {
+    const [[row]] = await pool.query(`SELECT r.*, u.user_no, u.nick_name, u.avatar_url, o.partner_name, o.payment_method, o.unit, o.quantity, o.total_price AS order_total_price, o.service_started_at, o.service_completed_at FROM refund_requests r LEFT JOIN users u ON u.openid = r.openid LEFT JOIN orders o ON o.id = r.order_id WHERE r.id = ?`, [id]);
+    if (!row) return send(res, 4004, null, '退款申请不存在');
+    let evidence = []; let rejectEvidence = [];
+    try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
+    try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
+    send(res, 0, { refund: { id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0), orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0), reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status, createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at) } });
+  } catch (error) { console.error(error); send(res, 5001, null, '退款审核详情读取失败'); }
 });
 
 app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
@@ -855,6 +872,7 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
   const id = Number(req.params.id);
   const status = String((req.body || {}).status || '');
   const rejectReason = String((req.body || {}).reason || '').trim().slice(0, 300);
+  const rejectEvidence = Array.isArray((req.body || {}).evidence) ? (req.body || {}).evidence.map((item) => String(item || '').slice(0, 512)).filter(Boolean).slice(0, 3) : [];
   if (!Number.isInteger(id) || id <= 0 || !['approved', 'rejected'].includes(status)) return send(res, 4002, null, '退款审核状态无效');
   if (status === 'rejected' && !rejectReason) return send(res, 4002, null, '请填写拒绝退款原因');
   let connection;
@@ -865,7 +883,7 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
     if (!refund) { await connection.rollback(); return send(res, 4004, null, '退款申请不存在'); }
     if (refund.status !== 'pending') { await connection.rollback(); return send(res, 4002, null, '该退款申请已处理'); }
     if (status === 'rejected') {
-      await connection.query("UPDATE refund_requests SET status = 'rejected', reject_reason = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [rejectReason, reviewerOpenid, id]);
+      await connection.query("UPDATE refund_requests SET status = 'rejected', reject_reason = ?, reject_evidence_json = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [rejectReason, JSON.stringify(rejectEvidence), reviewerOpenid, id]);
       await connection.commit();
       return send(res, 0, { id, status: 'rejected', rejectReason, notice: '拒绝原因已记录，请通过首页同一企微客服会话告知用户。' });
     }
