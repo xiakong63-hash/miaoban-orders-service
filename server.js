@@ -431,6 +431,56 @@ app.get('/api/partners/:id', async (req, res) => {
   }
 });
 
+app.get('/api/partners/:id/showcase', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '陪玩信息无效');
+  try {
+    const [[partner]] = await pool.query("SELECT * FROM partner_profiles WHERE id = ? AND status = 'approved'", [id]);
+    if (!partner) return send(res, 4004, null, '该陪玩暂不可展示');
+    const [posts] = await pool.query('SELECT id, content, created_at FROM partner_posts WHERE partner_profile_id = ? ORDER BY created_at DESC LIMIT 20', [id]);
+    const [comments] = await pool.query('SELECT id, nick_name, content, score, created_at FROM partner_comments WHERE partner_profile_id = ? ORDER BY created_at DESC LIMIT 30', [id]);
+    const [[giftCount]] = await pool.query('SELECT COUNT(*) AS total FROM partner_gifts WHERE partner_profile_id = ?', [id]);
+    send(res, 0, { partner: partnerRow(partner, false), posts: posts.map((x) => ({ id: Number(x.id), content: x.content, createdAt: formatDate(x.created_at) })), comments: comments.map((x) => ({ id: Number(x.id), nickName: x.nick_name, content: x.content, score: Number(x.score), createdAt: formatDate(x.created_at) })), giftCount: Number(giftCount.total || 0) });
+  } catch (error) { console.error(error); send(res, 5001, null, '陪玩展示资料读取失败'); }
+});
+
+app.post('/api/partners/:id/gifts', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  const gifts = { flower: { name: '喵喵花束', cost: 12 }, cheer: { name: '应援星星', cost: 30 }, crown: { name: '荣耀皇冠', cost: 80 } };
+  const gift = gifts[String((req.body || {}).giftKey || '')];
+  if (!Number.isInteger(id) || id <= 0 || !gift) return send(res, 4002, null, '礼物信息无效');
+  let connection;
+  try {
+    connection = await pool.getConnection(); await connection.beginTransaction();
+    const [[partner]] = await connection.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved' FOR UPDATE", [id]);
+    if (!partner) { await connection.rollback(); return send(res, 4004, null, '该陪玩暂不可赠送礼物'); }
+    await ensureWallet(connection, userOpenid);
+    const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [userOpenid]);
+    if (Number(wallet.cat_food_balance || 0) < gift.cost) { await connection.rollback(); return send(res, 4002, null, `猫粮不足，还需 ${gift.cost} 猫粮`); }
+    await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance - ? WHERE openid = ?', [gift.cost, userOpenid]);
+    await connection.query('INSERT INTO partner_gifts (partner_profile_id, openid, gift_key, gift_name, cat_food_cost) VALUES (?, ?, ?, ?, ?)', [id, userOpenid, String((req.body || {}).giftKey), gift.name, gift.cost]);
+    await addWalletRecord(connection, userOpenid, { catFoodDelta: -gift.cost, type: 'partner_gift', title: `赠送陪玩礼物：${gift.name}`, amount: 0 });
+    await connection.commit(); send(res, 0, { giftName: gift.name, catFoodBalance: Number(wallet.cat_food_balance || 0) - gift.cost });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '赠送礼物失败'); }
+  finally { if (connection) connection.release(); }
+});
+
+app.post('/api/partners/:id/comments', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id); const content = String((req.body || {}).content || '').trim().slice(0, 240); const score = Math.max(1, Math.min(5, Number((req.body || {}).score) || 5));
+  if (!Number.isInteger(id) || id <= 0 || content.length < 2) return send(res, 4002, null, '请填写至少 2 个字的评论');
+  try {
+    const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [id]);
+    if (!partner) return send(res, 4004, null, '该陪玩暂不可评论');
+    await ensureUser(userOpenid); const [[user]] = await pool.query('SELECT nick_name FROM users WHERE openid = ?', [userOpenid]);
+    const [result] = await pool.query('INSERT INTO partner_comments (partner_profile_id, openid, nick_name, content, score) VALUES (?, ?, ?, ?, ?)', [id, userOpenid, (user && user.nick_name) || '喵伴用户', content, score]);
+    send(res, 0, { comment: { id: Number(result.insertId), nickName: (user && user.nick_name) || '喵伴用户', content, score, createdAt: formatDate(new Date()) } });
+  } catch (error) { console.error(error); send(res, 5001, null, '提交评论失败'); }
+});
+
 app.get('/api/orders', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
