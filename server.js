@@ -935,6 +935,17 @@ app.get('/api/admin/partners', async (req, res) => {
   }
 });
 
+app.get('/api/admin/partners/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '陪玩资料无效');
+  try {
+    const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE id = ?', [id]);
+    if (!partner) return send(res, 4004, null, '陪玩资料不存在');
+    send(res, 0, { partner: partnerRow(partner, true) });
+  } catch (error) { console.error(error); send(res, 5001, null, '陪玩资料读取失败'); }
+});
+
 app.patch('/api/admin/partners/:id/status', async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const id = Number(req.params.id);
