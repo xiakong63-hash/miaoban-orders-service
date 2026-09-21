@@ -720,6 +720,33 @@ app.post('/api/orders/:id/refund-requests', async (req, res) => {
   } finally { if (connection) connection.release(); }
 });
 
+function refundRequestRow(row) {
+  let evidence = [];
+  try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
+  return { ...orderRow(row), refund: { id: Number(row.refund_id), status: row.refund_status, amount: money(row.refund_amount), reason: row.reason || '', rejectReason: row.reject_reason || '', evidence: Array.isArray(evidence) ? evidence : [], createdAt: formatDate(row.refund_created_at), reviewedAt: formatDate(row.reviewed_at), catFoodToDeduct: Number(row.cat_food_to_deduct || 0) } };
+}
+
+app.get('/api/refund-requests', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status = 'pending' ORDER BY r.created_at DESC`, [userOpenid]);
+    send(res, 0, { refunds: rows.map(refundRequestRow) });
+  } catch (error) { console.error(error); send(res, 5001, null, '退款订单读取失败'); }
+});
+
+app.get('/api/refund-requests/:id', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '退款申请无效');
+  try {
+    const [[row]] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.id = ? AND r.openid = ?`, [id, userOpenid]);
+    if (!row) return send(res, 4004, null, '退款申请不存在');
+    send(res, 0, { refund: refundRequestRow(row) });
+  } catch (error) { console.error(error); send(res, 5001, null, '退款详情读取失败'); }
+});
+
 app.get('/api/admin/summary', async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
