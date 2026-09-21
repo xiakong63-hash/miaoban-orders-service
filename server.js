@@ -730,7 +730,7 @@ app.get('/api/refund-requests', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   try {
-    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status = 'pending' ORDER BY r.created_at DESC`, [userOpenid]);
+    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.evidence_json, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status IN ('pending', 'rejected', 'refunded') ORDER BY r.created_at DESC`, [userOpenid]);
     send(res, 0, { refunds: rows.map(refundRequestRow) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款订单读取失败'); }
 });
