@@ -314,14 +314,25 @@ function partnerRow(row, includeOpenid) {
     hourPrice: Number(row.hour_price || 0),
     gamePrice: Number(row.game_price || 0),
     availableTime: row.available_time || '',
+    serviceItems: parsePartnerServiceItems(row.service_items),
     status: row.status || 'pending',
     createdAt: formatDate(row.created_at),
     updatedAt: formatDate(row.updated_at)
   };
   result.tag = `${result.game} · ${result.level}陪陪`;
   result.service = `${result.game}${result.level}陪玩`;
+  result.serviceItemNames = result.serviceItems.map((id) => PARTNER_SERVICE_NAMES[id]);
   if (includeOpenid) result.openid = row.openid;
   return result;
+}
+
+const PARTNER_SERVICE_IDS = new Set(['val-fun-silent', 'val-fun-dialect', 'val-fun-ace', 'val-fun-duo', 'val-fun-lines', 'val-fun-contract', 'fun-steam', 'lei-watch', 'lei-live', 'teaching-basic', 'teaching-custom', 'lei-voice', 'lei-sleep', 'lei-text']);
+const PARTNER_SERVICE_NAMES = { 'val-fun-silent': '静音雷达局', 'val-fun-dialect': '方言捕捉局', 'val-fun-ace': '王牌加时局', 'val-fun-duo': '特工搭档局', 'val-fun-lines': '特工台词局', 'val-fun-contract': '猫猫平行宇宙局', 'fun-steam': 'Steam 联机', 'lei-watch': '一起看影视', 'lei-live': '直播陪看', 'teaching-basic': '基础教学', 'teaching-custom': '自定义教学与复盘', 'lei-voice': '语音聊天', 'lei-sleep': '哄睡陪伴', 'lei-text': '文字陪聊' };
+function parsePartnerServiceItems(value) {
+  try {
+    const items = typeof value === 'string' ? JSON.parse(value) : value;
+    return Array.isArray(items) ? items.filter((id) => PARTNER_SERVICE_IDS.has(id)) : [];
+  } catch (_) { return []; }
 }
 
 async function ensureUser(openid) {
@@ -569,20 +580,22 @@ app.post('/api/partner/apply', async (req, res) => {
   const hourPrice = Number(body.hourPrice);
   const gamePrice = Number(body.gamePrice);
   const availableTime = String(body.availableTime || '').trim().slice(0, 80);
+  const serviceItems = body.serviceItems === undefined ? [] : body.serviceItems;
+  if (!Array.isArray(serviceItems) || serviceItems.length > PARTNER_SERVICE_IDS.size || new Set(serviceItems).size !== serviceItems.length || serviceItems.some((id) => !PARTNER_SERVICE_IDS.has(id))) return send(res, 4002, null, '可接项目选择无效');
   if (!displayName || !gameName || !gender || !level || !rankText || !description || !availableTime || !Number.isFinite(hourPrice) || hourPrice <= 0 || !Number.isFinite(gamePrice) || gamePrice <= 0) {
     return send(res, 4002, null, '请完整填写陪陪资料和价格');
   }
-  if ((audioUrl && (audioDuration < 1 || audioDuration > 12)) || (!audioUrl && audioDuration !== 0)) return send(res, 4002, null, '介绍语音须为 1 至 12 秒，或不录制');
+  if (!audioUrl || audioDuration < 1 || audioDuration > 12) return send(res, 4002, null, '请上传 1 至 12 秒介绍语音');
   try {
     await ensureUser(userOpenid);
     const partnerNo = await ensurePartnerNo(userOpenid);
     await pool.query(
-      `INSERT INTO partner_profiles (openid, partner_no, display_name, avatar_url, game_name, game, gender, service_level, rank_text, description, audio_url, audio_duration, hour_price, game_price, available_time, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+      `INSERT INTO partner_profiles (openid, partner_no, display_name, avatar_url, game_name, game, gender, service_level, rank_text, description, audio_url, audio_duration, hour_price, game_price, available_time, service_items, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
        ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), avatar_url = VALUES(avatar_url), game_name = VALUES(game_name),
        game = VALUES(game), gender = VALUES(gender), service_level = VALUES(service_level), rank_text = VALUES(rank_text), description = VALUES(description),
-       audio_url = VALUES(audio_url), audio_duration = VALUES(audio_duration), hour_price = VALUES(hour_price), game_price = VALUES(game_price), available_time = VALUES(available_time), status = 'pending'`,
-      [userOpenid, partnerNo, displayName, avatarUrl, gameName, game, gender, level, rankText, description, audioUrl, audioDuration, hourPrice, gamePrice, availableTime]
+       audio_url = VALUES(audio_url), audio_duration = VALUES(audio_duration), hour_price = VALUES(hour_price), game_price = VALUES(game_price), available_time = VALUES(available_time), service_items = VALUES(service_items), status = 'pending'`,
+      [userOpenid, partnerNo, displayName, avatarUrl, gameName, game, gender, level, rankText, description, audioUrl, audioDuration, hourPrice, gamePrice, availableTime, JSON.stringify(serviceItems)]
     );
     const [[partner]] = await pool.query('SELECT * FROM partner_profiles WHERE openid = ?', [userOpenid]);
     send(res, 0, { partner: partnerRow(partner, false) });
@@ -594,12 +607,15 @@ app.post('/api/partner/apply', async (req, res) => {
 
 app.get('/api/partners', async (req, res) => {
   const category = String(req.query.category || '').trim().slice(0, 32);
+  const serviceItem = String(req.query.serviceItem || '').trim();
+  if (serviceItem && !PARTNER_SERVICE_IDS.has(serviceItem)) return send(res, 4002, null, '服务项目无效');
   const params = [];
   let where = "WHERE status = 'approved'";
   if (category === 'valorant') {
     where += ' AND game = ?';
     params.push('无畏契约');
   }
+  if (serviceItem) { where += ' AND JSON_CONTAINS(service_items, JSON_QUOTE(?))'; params.push(serviceItem); }
   try {
     const [rows] = await pool.query(`SELECT * FROM partner_profiles ${where} ORDER BY updated_at DESC LIMIT 30`, params);
     send(res, 0, { partners: rows.map((row) => partnerRow(row, false)) });
@@ -1127,6 +1143,9 @@ app.post('/api/orders', async (req, res) => {
   const orderQuantity = Number(body.quantity);
   const valorantFunModes = { 'val-fun-silent': ['静音雷达局', 65], 'val-fun-dialect': ['方言捕捉局', 65], 'val-fun-ace': ['王牌加时局', 65], 'val-fun-duo': ['特工搭档局', 60], 'val-fun-lines': ['特工台词局', 60], 'val-fun-contract': ['猫猫平行宇宙局', 65] };
   const funMode = valorantFunModes[body.funId];
+  const serviceItem = String(body.serviceItem || '');
+  if (serviceItem && !PARTNER_SERVICE_IDS.has(serviceItem)) return send(res, 4002, null, '服务项目无效');
+  if (serviceItem && (!!valorantFunModes[serviceItem] !== !!funMode || (funMode && body.funId !== serviceItem))) return send(res, 4002, null, '趣味单项目不一致');
   if (!Number.isInteger(orderQuantity) || orderQuantity < 1 || !['小时', '局'].includes(body.unit) ||
       (body.unit === '小时' ? body.priceMode !== 'hour' : body.priceMode !== 'game') || originalTotalPrice <= 0) {
     return send(res, 4002, null, '下单数量或服务原价无效');
@@ -1142,15 +1161,19 @@ app.post('/api/orders', async (req, res) => {
     let partnerProfileId = null;
     let partnerPrice = null;
     if (Number.isInteger(requestedPartnerId) && requestedPartnerId > 0) {
-      const [[partner]] = await pool.query("SELECT id, hour_price, game_price FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
+      const [[partner]] = await pool.query("SELECT id, game, service_level, service_items, hour_price, game_price FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
       if (partner) {
+        const approvedItems = parsePartnerServiceItems(partner.service_items);
+        if ((serviceItem && !approvedItems.includes(serviceItem)) || (funMode && !approvedItems.includes(body.funId))) return send(res, 4002, null, '该陪陪暂未提供此项目');
+        if (serviceItem && !funMode && (body.service !== PARTNER_SERVICE_NAMES[serviceItem] || body.unit !== '小时')) return send(res, 4002, null, '服务项目或计费方式不一致');
+        if (!serviceItem && !funMode && body.service !== `${partner.game}${partner.service_level}陪玩`) return send(res, 4002, null, '陪陪服务类型不一致');
         partnerProfileId = partner.id;
         partnerPrice = money((funMode ? funMode[1] : (body.unit === '小时' ? partner.hour_price : partner.game_price)) * orderQuantity);
       }
       else return send(res, 4002, null, '陪陪已下架，请返回重新选择');
     }
-    if (couponId > 0 && partnerPrice !== null && originalTotalPrice !== partnerPrice) {
-      return send(res, 4002, null, '服务原价已变化，请返回重新选择后使用优惠券');
+    if (partnerPrice !== null && originalTotalPrice !== partnerPrice) {
+      return send(res, 4002, null, '服务原价已变化，请返回重新选择');
     }
     connection = await pool.getConnection();
     await connection.beginTransaction();
