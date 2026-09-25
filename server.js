@@ -110,10 +110,10 @@ const LUCKY_PRIZES = [
   { key: 'small_food', name: '小猫粮包', probability: 33, type: 'cat_food', catFood: 25, desc: '返还 25 猫粮，并获得随机趣味任务资格', special: false, expiresDays: 0 },
   { key: 'medium_food', name: '中猫粮包', probability: 25, type: 'cat_food', catFood: 50, desc: '返还 50 猫粮', special: false, expiresDays: 0 },
   { key: 'large_food', name: '大猫粮包', probability: 18, type: 'cat_food', catFood: 100, desc: '返还 100 猫粮', special: false, expiresDays: 0 },
-  { key: 'coupon_98', name: '9.8折券', probability: 10, type: 'coupon', rate: 0.98, maxDiscount: 10, desc: '单笔最高优惠 ¥10', special: true, expiresDays: 7 },
-  { key: 'coupon_95', name: '9.5折券', probability: 7, type: 'coupon', rate: 0.95, maxDiscount: 20, desc: '单笔最高优惠 ¥20', special: true, expiresDays: 7 },
-  { key: 'coupon_90', name: '9折券', probability: 3.5, type: 'coupon', rate: 0.9, maxDiscount: 25, desc: '单笔最高优惠 ¥25', special: true, expiresDays: 7 },
-  { key: 'fun_coupon', name: '趣味单体验券', probability: 2, type: 'coupon', rate: 1, maxDiscount: 10, desc: '趣味单减免 ¥10', special: true, expiresDays: 7 },
+  { key: 'coupon_98', name: '9.8折券', probability: 10, type: 'coupon', rate: 0.98, maxDiscount: 10, desc: '单笔最高优惠 10 金币', special: true, expiresDays: 7 },
+  { key: 'coupon_95', name: '9.5折券', probability: 7, type: 'coupon', rate: 0.95, maxDiscount: 20, desc: '单笔最高优惠 20 金币', special: true, expiresDays: 7 },
+  { key: 'coupon_90', name: '9折券', probability: 3.5, type: 'coupon', rate: 0.9, maxDiscount: 25, desc: '单笔最高优惠 25 金币', special: true, expiresDays: 7 },
+  { key: 'fun_coupon', name: '趣味单体验券', probability: 2, type: 'coupon', rate: 1, maxDiscount: 10, desc: '趣味单减免 10 金币', special: true, expiresDays: 7 },
   { key: 'activity_entry', name: '活动报名资格', probability: 1, type: 'activity', desc: '可报名当期指定活动', special: true, expiresDays: 30 },
   { key: 'crown_trial', name: '个冠体验券', probability: 0.5, type: 'crown', desc: '30 天内可激活，激活后享受 3 天个冠体验', special: true, expiresDays: 30 }
 ];
@@ -205,8 +205,8 @@ function couponRow(row) {
   const couponName = isDiscount ? String(row.coupon_name || '').replace(/(98|95|90|88)折/g, (_match, percent) => `${discountLabel(Number(percent) / 100)}折`) : row.coupon_name;
   return {
     id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost || 0), couponType: isDiscount ? 'discount' : 'fixed', discountRate: rate, maxDiscount: cap,
-    name: couponName || (isDiscount ? `${discountLabel(rate)}折券` : `¥${money(row.amount)} 猫粮兑换券`), displayValue: isDiscount ? `${discountLabel(rate)}折` : `¥${money(row.amount)}`,
-    description: isDiscount ? `${discountLabel(rate)}折 · 单笔最高优惠 ¥${cap}` : (Number(row.min_order_amount || 0) ? `满 ¥${money(row.min_order_amount)} 可用` : `面额 ¥${money(row.amount)}`), minOrderAmount: money(row.min_order_amount),
+    name: couponName || (isDiscount ? `${discountLabel(rate)}折券` : `${money(row.amount)} 金币猫粮兑换券`), displayValue: isDiscount ? `${discountLabel(rate)}折` : `${money(row.amount)} 金币`,
+    description: isDiscount ? `${discountLabel(rate)}折 · 单笔最高优惠 ${cap} 金币` : (Number(row.min_order_amount || 0) ? `满 ${money(row.min_order_amount)} 金币可用` : `面额 ${money(row.amount)} 金币`), minOrderAmount: money(row.min_order_amount),
     status: row.status || 'unused', usedOrderId: row.used_order_id || '', createdAt: formatDate(row.created_at), usedAt: formatDate(row.used_at), expiresAt: formatDate(row.expires_at)
   };
 }
@@ -267,8 +267,8 @@ function membershipView(row) {
     birthdayEligible: false, birthdayMessage: active ? '生日月可领取专属猫粮福利' : '',
     benefits: active ? [
       { icon: '粮', title: `入会赠 ${plan.catFood} 猫粮`, desc: '升级时仅补发两档差额' },
-      { icon: '券', title: `每月 ${plan.monthlyCoupons} 张 ${discountLabel(plan.monthlyRate)}折券`, desc: `单笔最高优惠 ¥${plan.monthlyCap}` },
-      { icon: '季', title: `每季度 1 张 ${discountLabel(plan.quarterlyRate)}折券`, desc: `单笔最高优惠 ¥${plan.quarterlyCap}` },
+      { icon: '券', title: `每月 ${plan.monthlyCoupons} 张 ${discountLabel(plan.monthlyRate)}折券`, desc: `单笔最高优惠 ${plan.monthlyCap} 金币` },
+      { icon: '季', title: `每季度 1 张 ${discountLabel(plan.quarterlyRate)}折券`, desc: `单笔最高优惠 ${plan.quarterlyCap} 金币` },
       { icon: '优', title: '点单优先匹配', desc: plan.tier === 'svip' ? '优先匹配并优先安排' : '优先匹配服务陪玩' },
       { icon: '窝', title: plan.tier === 'svip' ? '专属小窝、SVIP身份标识' : '专属小窝或会员身份标识', desc: `每年可申请 ${plan.rescheduleCount} 次改期或换陪` },
       { icon: '生', title: `生日月赠送 ${plan.birthdayGift} 猫粮`, desc: '生日当月可在此页面领取一次' },
@@ -613,6 +613,45 @@ app.get('/api/partners/:id', async (req, res) => {
     console.error(error);
     send(res, 5001, null, '陪陪资料读取失败');
   }
+});
+
+app.get('/api/follows', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query('SELECT p.* FROM partner_follows f JOIN partner_profiles p ON p.id = f.partner_profile_id WHERE f.openid = ? ORDER BY f.created_at DESC LIMIT 100', [userOpenid]);
+    send(res, 0, { partners: rows.map((row) => partnerRow(row, false)) });
+  } catch (error) { console.error(error); send(res, 5001, null, '我的关注读取失败'); }
+});
+
+app.get('/api/partners/:id/follow', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '陪陪信息无效');
+  try {
+    const [[row]] = await pool.query('SELECT 1 AS followed FROM partner_follows WHERE openid = ? AND partner_profile_id = ?', [userOpenid, id]);
+    send(res, 0, { followed: !!row });
+  } catch (error) { console.error(error); send(res, 5001, null, '关注状态读取失败'); }
+});
+
+app.post('/api/partners/:id/follow', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  const followed = (req.body || {}).followed;
+  if (!Number.isInteger(id) || id <= 0 || typeof followed !== 'boolean') return send(res, 4002, null, '关注信息无效');
+  try {
+    if (followed) {
+      const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [id]);
+      if (!partner) return send(res, 4004, null, '该陪陪暂不可关注');
+      await ensureUser(userOpenid);
+      await pool.query('INSERT IGNORE INTO partner_follows (openid, partner_profile_id) VALUES (?, ?)', [userOpenid, id]);
+    } else {
+      await pool.query('DELETE FROM partner_follows WHERE openid = ? AND partner_profile_id = ?', [userOpenid, id]);
+    }
+    send(res, 0, { followed });
+  } catch (error) { console.error(error); send(res, 5001, null, '关注操作失败'); }
 });
 
 app.get('/api/partners/:id/showcase', async (req, res) => {
@@ -1070,7 +1109,7 @@ app.post('/api/orders', async (req, res) => {
       if (/趣味/.test(String(body.service || '')) && await weeklyFunCouponUsage(connection, userOpenid) >= FUN_COUPON_WEEKLY_LIMIT) {
         await connection.rollback(); return send(res, 4002, null, '本周趣味单已使用 2 张优惠券，下周可继续使用');
       }
-      if (Number(row.min_order_amount || 0) > originalTotalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需订单原价满 ¥${money(row.min_order_amount)} 才可使用`); }
+      if (Number(row.min_order_amount || 0) > originalTotalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需订单原价满 ${money(row.min_order_amount)} 金币才可使用`); }
       coupon = row;
     }
     const couponDiscount = money(!coupon ? 0 : (coupon.coupon_type === 'discount' && Number(coupon.discount_rate || 0) > 0 && Number(coupon.discount_rate || 0) < 1
@@ -1137,7 +1176,7 @@ app.post('/api/orders/:id/renew', async (req, res) => {
       if (/趣味/.test(String(source.service || '')) && await weeklyFunCouponUsage(connection, userOpenid) >= FUN_COUPON_WEEKLY_LIMIT) {
         await connection.rollback(); return send(res, 4002, null, '本周趣味单已使用 2 张优惠券，下周可继续使用');
       }
-      if (Number(row.min_order_amount || 0) > totalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需续单原价满 ¥${money(row.min_order_amount)} 才可使用`); }
+      if (Number(row.min_order_amount || 0) > totalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需续单原价满 ${money(row.min_order_amount)} 金币才可使用`); }
       if (renewUnit === '小时' && quantity < 1) { await connection.rollback(); return send(res, 4002, null, '按时长续单满 60 分钟才可使用优惠券'); }
       coupon = row;
       couponDiscount = money(row.coupon_type === 'discount' && Number(row.discount_rate || 0) > 0 && Number(row.discount_rate || 0) < 1 ? Math.min(totalPrice * (1 - Number(row.discount_rate)), Number(row.max_discount || 0)) : Math.min(totalPrice, Number(row.amount || 0)));
@@ -1210,7 +1249,7 @@ app.post('/api/orders/:id/refund-direct-disabled', async (req, res) => {
     }
     await connection.query(
       "UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?",
-      [` [已退款：¥${refundAmount}，扣回${catFoodToDeduct}猫粮]`, order.id]
+      [` [已退款：${refundAmount} 金币，扣回${catFoodToDeduct}猫粮]`, order.id]
     );
     let couponReturned = false;
     if (order.coupon_id && !order.service_started_at) {
@@ -1446,7 +1485,7 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
     await ensureWallet(connection, refund.openid);
     const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [refund.openid]);
     if (Number(wallet.cat_food_balance || 0) < catFoodToDeduct) { await connection.rollback(); return send(res, 4002, null, `用户猫粮余额不足，需扣回 ${catFoodToDeduct} 猫粮`); }
-    await connection.query("UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：¥${refundAmount}，原路退回（演示），扣回${catFoodToDeduct}猫粮]`, order.id]);
+    await connection.query("UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：${refundAmount} 金币，原路退回（演示），扣回${catFoodToDeduct}猫粮]`, order.id]);
     let couponReturned = false;
     if (order.coupon_id && !order.service_started_at) {
       const [couponResult] = await connection.query(
