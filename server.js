@@ -1,6 +1,9 @@
 const crypto = require('crypto');
 const express = require('express');
 const mysql = require('mysql2/promise');
+const { FUN_COUPON_WEEKLY_LIMIT, weeklyFunCouponUsage } = require('./fun-coupon-limit');
+const PARTNER_GIFTS = require('./gift-catalog');
+const MEMBERSHIP_DEMO_ENABLED = process.env.MEMBERSHIP_DEMO_ENABLED === 'true';
 
 const app = express();
 app.use(express.json());
@@ -80,6 +83,10 @@ function money(value) {
   return Math.round(Number(value || 0) * 100) / 100;
 }
 
+function discountLabel(rate) {
+  return Number((Number(rate) * 10).toFixed(1));
+}
+
 async function ensureWallet(executor, openid) {
   await executor.query('INSERT IGNORE INTO user_wallets (openid, coin_balance, cat_food_balance) VALUES (?, ?, 0)', [openid, INITIAL_COIN_BALANCE]);
   const [[wallet]] = await executor.query('SELECT * FROM user_wallets WHERE openid = ?', [openid]);
@@ -117,6 +124,25 @@ const CAT_FOOD_COUPON_OPTIONS = [
   { key: '500_50', threshold: 500, amount: 50, cost: 425 }, { key: '800_80', threshold: 800, amount: 80, cost: 640 },
   { key: '1200_120', threshold: 1200, amount: 120, cost: 900 }
 ];
+
+const COUPON_ELIGIBLE_FUN_SERVICES = new Set(
+  String(process.env.COUPON_ELIGIBLE_FUN_SERVICES || '').split(',').map((service) => service.trim()).filter(Boolean)
+);
+
+function couponOrderError(coupon, scene, service, paymentMethod, unit, quantity) {
+  const orderScene = /趣味/.test(service) ? 'fun' : String(scene || 'regular');
+  if (['special', 'group', 'agent', 'activity', 'membership', 'gift', 'crown', 'event'].includes(orderScene) ||
+      /特价|拼单|代付|活动价|会员费|礼物订单|冠名权益|活动报名/.test(service)) {
+    return '该订单类型不可使用优惠券';
+  }
+  if (orderScene === 'fun' && coupon.coupon_name !== '趣味单体验券' && !COUPON_ELIGIBLE_FUN_SERVICES.has(service)) {
+    return '该趣味单尚未公告支持优惠券';
+  }
+  if (coupon.coupon_name === '趣味单体验券' && orderScene !== 'fun') return '趣味单体验券仅限趣味单使用';
+  if (/赠送余额/.test(paymentMethod)) return '预存赠送余额不可与优惠券叠加使用';
+  if (unit === '小时' && Number(quantity) < 1) return '按时长订单满 60 分钟才可使用优惠券';
+  return '';
+}
 
 const GROWTH_LEVELS = [
   { key: 'iron', name: '萌爪黑铁', threshold: 0, reward: 0, freeLucky: 0 }, { key: 'bronze', name: '小爪青铜', threshold: 500, reward: 50, freeLucky: 0 },
@@ -176,10 +202,11 @@ function couponRow(row) {
   const rate = Number(row.discount_rate || 0);
   const cap = money(row.max_discount);
   const isDiscount = row.coupon_type === 'discount' && rate > 0 && rate < 1;
+  const couponName = isDiscount ? String(row.coupon_name || '').replace(/(98|95|90|88)折/g, (_match, percent) => `${discountLabel(Number(percent) / 100)}折`) : row.coupon_name;
   return {
     id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost || 0), couponType: isDiscount ? 'discount' : 'fixed', discountRate: rate, maxDiscount: cap,
-    name: row.coupon_name || (isDiscount ? `${Math.round(rate * 100)}折券` : `¥${money(row.amount)} 猫粮兑换券`), displayValue: isDiscount ? `${Math.round(rate * 100)}折` : `¥${money(row.amount)}`,
-    description: isDiscount ? `${Math.round(rate * 100)}折 · 单笔最高优惠 ¥${cap}` : (Number(row.min_order_amount || 0) ? `满 ¥${money(row.min_order_amount)} 可用` : `面额 ¥${money(row.amount)}`), minOrderAmount: money(row.min_order_amount),
+    name: couponName || (isDiscount ? `${discountLabel(rate)}折券` : `¥${money(row.amount)} 猫粮兑换券`), displayValue: isDiscount ? `${discountLabel(rate)}折` : `¥${money(row.amount)}`,
+    description: isDiscount ? `${discountLabel(rate)}折 · 单笔最高优惠 ¥${cap}` : (Number(row.min_order_amount || 0) ? `满 ¥${money(row.min_order_amount)} 可用` : `面额 ¥${money(row.amount)}`), minOrderAmount: money(row.min_order_amount),
     status: row.status || 'unused', usedOrderId: row.used_order_id || '', createdAt: formatDate(row.created_at), usedAt: formatDate(row.used_at), expiresAt: formatDate(row.expires_at)
   };
 }
@@ -194,16 +221,37 @@ async function issueRecurringMembershipCoupons(executor, membership) {
   const cycles = cycleKeys();
   let granted = 0;
   if (membership.monthly_coupon_cycle !== cycles.month) {
-    for (let index = 0; index < plan.monthlyCoupons; index += 1) await issueMembershipCoupon(executor, membership.openid, plan.monthlyRate, plan.monthlyCap, `${plan.name}${Math.round(plan.monthlyRate * 100)}折月券`, 'membership_monthly');
+    for (let index = 0; index < plan.monthlyCoupons; index += 1) await issueMembershipCoupon(executor, membership.openid, plan.monthlyRate, plan.monthlyCap, `${plan.name}${discountLabel(plan.monthlyRate)}折月券`, 'membership_monthly');
     membership.monthly_coupon_cycle = cycles.month;
     granted += plan.monthlyCoupons;
   }
   if (membership.quarterly_coupon_cycle !== cycles.quarter) {
-    await issueMembershipCoupon(executor, membership.openid, plan.quarterlyRate, plan.quarterlyCap, `${plan.name}${Math.round(plan.quarterlyRate * 100)}折季度券`, 'membership_quarterly');
+    await issueMembershipCoupon(executor, membership.openid, plan.quarterlyRate, plan.quarterlyCap, `${plan.name}${discountLabel(plan.quarterlyRate)}折季度券`, 'membership_quarterly');
     membership.quarterly_coupon_cycle = cycles.quarter;
     granted += 1;
   }
   await executor.query('UPDATE user_memberships SET monthly_coupon_cycle = ?, quarterly_coupon_cycle = ? WHERE openid = ?', [membership.monthly_coupon_cycle, membership.quarterly_coupon_cycle, membership.openid]);
+  return granted;
+}
+
+async function upgradeMembershipCoupons(executor, openid) {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  const svip = MEMBERSHIP_PLANS.svip;
+  const [monthly] = await executor.query("SELECT id, status FROM user_coupons WHERE openid = ? AND source = 'membership_monthly' AND created_at >= ? FOR UPDATE", [openid, monthStart]);
+  const [quarterly] = await executor.query("SELECT id, status FROM user_coupons WHERE openid = ? AND source = 'membership_quarterly' AND created_at >= ? FOR UPDATE", [openid, quarterStart]);
+  await executor.query("UPDATE user_coupons SET discount_rate = ?, max_discount = ?, coupon_name = ? WHERE openid = ? AND source = 'membership_monthly' AND status = 'unused' AND created_at >= ?", [svip.monthlyRate, svip.monthlyCap, `${svip.name}${discountLabel(svip.monthlyRate)}折月券`, openid, monthStart]);
+  await executor.query("UPDATE user_coupons SET discount_rate = ?, max_discount = ?, coupon_name = ? WHERE openid = ? AND source = 'membership_quarterly' AND status = 'unused' AND created_at >= ?", [svip.quarterlyRate, svip.quarterlyCap, `${svip.name}${discountLabel(svip.quarterlyRate)}折季度券`, openid, quarterStart]);
+  let granted = 0;
+  for (let index = monthly.length; index < svip.monthlyCoupons; index += 1) {
+    await issueMembershipCoupon(executor, openid, svip.monthlyRate, svip.monthlyCap, `${svip.name}${discountLabel(svip.monthlyRate)}折月券`, 'membership_monthly');
+    granted += 1;
+  }
+  if (!quarterly.length) {
+    await issueMembershipCoupon(executor, openid, svip.quarterlyRate, svip.quarterlyCap, `${svip.name}${discountLabel(svip.quarterlyRate)}折季度券`, 'membership_quarterly');
+    granted += 1;
+  }
   return granted;
 }
 
@@ -218,9 +266,9 @@ function membershipView(row) {
     active, tier: plan.tier, name: plan.name, badge: plan.badge, expiresAt: active ? expires.toLocaleDateString('zh-CN') : '', daysLeft, birthdayGift: plan.birthdayGift,
     birthdayEligible: false, birthdayMessage: active ? '生日月可领取专属猫粮福利' : '',
     benefits: active ? [
-      { icon: '粮', title: `入会赠 ${plan.catFood} 猫粮`, desc: '已随开通自动到账' },
-      { icon: '券', title: `每月 ${plan.monthlyCoupons} 张 ${Math.round(plan.monthlyRate * 100)}折券`, desc: `单笔最高优惠 ¥${plan.monthlyCap}` },
-      { icon: '季', title: `每季度 1 张 ${Math.round(plan.quarterlyRate * 100)}折券`, desc: `单笔最高优惠 ¥${plan.quarterlyCap}` },
+      { icon: '粮', title: `入会赠 ${plan.catFood} 猫粮`, desc: '升级时仅补发两档差额' },
+      { icon: '券', title: `每月 ${plan.monthlyCoupons} 张 ${discountLabel(plan.monthlyRate)}折券`, desc: `单笔最高优惠 ¥${plan.monthlyCap}` },
+      { icon: '季', title: `每季度 1 张 ${discountLabel(plan.quarterlyRate)}折券`, desc: `单笔最高优惠 ¥${plan.quarterlyCap}` },
       { icon: '优', title: '点单优先匹配', desc: plan.tier === 'svip' ? '优先匹配并优先安排' : '优先匹配服务陪玩' },
       { icon: '窝', title: plan.tier === 'svip' ? '专属小窝、SVIP身份标识' : '专属小窝或会员身份标识', desc: `每年可申请 ${plan.rescheduleCount} 次改期或换陪` },
       { icon: '生', title: `生日月赠送 ${plan.birthdayGift} 猫粮`, desc: '生日当月可在此页面领取一次' },
@@ -517,7 +565,7 @@ app.post('/api/partner/apply', async (req, res) => {
   if (!displayName || !gameName || !gender || !level || !rankText || !description || !availableTime || !Number.isFinite(hourPrice) || hourPrice <= 0 || !Number.isFinite(gamePrice) || gamePrice <= 0) {
     return send(res, 4002, null, '请完整填写陪陪资料和价格');
   }
-  if (!audioUrl || audioDuration < 1 || audioDuration > 12) return send(res, 4002, null, '请录制 1 至 12 秒的介绍语音');
+  if ((audioUrl && (audioDuration < 1 || audioDuration > 12)) || (!audioUrl && audioDuration !== 0)) return send(res, 4002, null, '介绍语音须为 1 至 12 秒，或不录制');
   try {
     await ensureUser(userOpenid);
     const partnerNo = await ensurePartnerNo(userOpenid);
@@ -575,7 +623,7 @@ app.get('/api/partners/:id/showcase', async (req, res) => {
     if (!partner) return send(res, 4004, null, '该陪玩暂不可展示');
     const [posts] = await pool.query('SELECT id, content, created_at FROM partner_posts WHERE partner_profile_id = ? ORDER BY created_at DESC LIMIT 20', [id]);
     const [comments] = await pool.query('SELECT id, nick_name, content, score, created_at FROM partner_comments WHERE partner_profile_id = ? ORDER BY created_at DESC LIMIT 30', [id]);
-    const [[giftCount]] = await pool.query('SELECT COUNT(*) AS total FROM partner_gifts WHERE partner_profile_id = ?', [id]);
+    const [[giftCount]] = await pool.query("SELECT COUNT(*) AS total FROM partner_gifts WHERE partner_profile_id = ? AND status = 'valid'", [id]);
     send(res, 0, { partner: partnerRow(partner, false), posts: posts.map((x) => ({ id: Number(x.id), content: x.content, createdAt: formatDate(x.created_at) })), comments: comments.map((x) => ({ id: Number(x.id), nickName: x.nick_name, content: x.content, score: Number(x.score), createdAt: formatDate(x.created_at) })), giftCount: Number(giftCount.total || 0) });
   } catch (error) { console.error(error); send(res, 5001, null, '陪玩展示资料读取失败'); }
 });
@@ -584,24 +632,66 @@ app.post('/api/partners/:id/gifts', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   const id = Number(req.params.id);
-  const gifts = { flower: { name: '喵喵花束', cost: 12 }, cheer: { name: '应援星星', cost: 30 }, crown: { name: '荣耀皇冠', cost: 80 } };
-  const gift = gifts[String((req.body || {}).giftKey || '')];
+  const body = req.body || {};
+  const gift = PARTNER_GIFTS.find((item) => item.key === String(body.giftKey || ''));
   if (!Number.isInteger(id) || id <= 0 || !gift) return send(res, 4002, null, '礼物信息无效');
+  const blessing = gift.cost >= 500 ? String(body.blessing || '').trim() : '';
+  if (blessing.length > 80 || /(?:https?:\/\/|www\.|\b1[3-9]\d{9}\b|微信号|加我微信|vx[:：]|辱骂)/i.test(blessing)) return send(res, 4002, null, '祝福语包含不合适内容，请修改后重试');
+  const broadcastOptIn = gift.cost >= 1000 && body.broadcastOptIn === true ? 1 : 0;
   let connection;
   try {
+    await ensureUser(userOpenid);
     connection = await pool.getConnection(); await connection.beginTransaction();
-    const [[partner]] = await connection.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved' FOR UPDATE", [id]);
+    const [[partner]] = await connection.query("SELECT id, display_name FROM partner_profiles WHERE id = ? AND status = 'approved' FOR UPDATE", [id]);
     if (!partner) { await connection.rollback(); return send(res, 4004, null, '该陪玩暂不可赠送礼物'); }
+    const [[donor]] = await connection.query('SELECT nick_name FROM users WHERE openid = ?', [userOpenid]);
     await ensureWallet(connection, userOpenid);
     const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [userOpenid]);
-    if (Number(wallet.cat_food_balance || 0) < gift.cost) { await connection.rollback(); return send(res, 4002, null, `猫粮不足，还需 ${gift.cost} 猫粮`); }
-    await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance - ? WHERE openid = ?', [gift.cost, userOpenid]);
-    await connection.query('INSERT INTO partner_gifts (partner_profile_id, openid, gift_key, gift_name, cat_food_cost) VALUES (?, ?, ?, ?, ?)', [id, userOpenid, String((req.body || {}).giftKey), gift.name, gift.cost]);
-    await addWalletRecord(connection, userOpenid, { catFoodDelta: -gift.cost, type: 'partner_gift', title: `赠送陪玩礼物：${gift.name}`, amount: 0 });
-    await queueGrowth(connection, userOpenid, gift.cost / 10, 'gift_consumption', `赠送礼物：${gift.name}`, null, 24);
-    await connection.commit(); send(res, 0, { giftName: gift.name, catFoodBalance: Number(wallet.cat_food_balance || 0) - gift.cost });
+    const [deduct] = await connection.query('UPDATE user_wallets SET coin_balance = coin_balance - ? WHERE openid = ? AND coin_balance >= ?', [gift.cost, userOpenid, gift.cost]);
+    if (!deduct.affectedRows) { await connection.rollback(); return send(res, 4002, null, `金币不足，还需 ${Math.max(0, gift.cost - Number(wallet.coin_balance || 0))} 金币`); }
+    const [giftResult] = await connection.query('INSERT INTO partner_gifts (partner_profile_id, openid, gift_key, gift_name, cat_food_cost, coin_cost, donor_nick_name, recipient_name, blessing, broadcast_opt_in) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)', [id, userOpenid, gift.key, gift.name, gift.cost, (donor && donor.nick_name) || '喵伴用户', partner.display_name || '陪陪', blessing, broadcastOptIn]);
+    const giftNo = `MG${String(giftResult.insertId).padStart(8, '0')}`;
+    await addWalletRecord(connection, userOpenid, { coinDelta: -gift.cost, type: 'partner_gift', title: `赠送陪玩礼物：${gift.name}`, amount: gift.cost, orderId: giftNo });
+    await queueGrowth(connection, userOpenid, gift.cost, 'gift_consumption', `赠送礼物：${gift.name}`, giftNo, 24);
+    await connection.commit(); send(res, 0, { giftName: gift.name, giftNo, coinBalance: money(Number(wallet.coin_balance || 0) - gift.cost) });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '赠送礼物失败'); }
   finally { if (connection) connection.release(); }
+});
+
+app.get('/api/gifts/mine', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  try {
+    const [rows] = await pool.query('SELECT g.*, r.status AS refund_status FROM partner_gifts g LEFT JOIN gift_refund_requests r ON r.gift_id = g.id WHERE g.openid = ? ORDER BY g.created_at DESC LIMIT 100', [userOpenid]);
+    send(res, 0, { gifts: rows.map((row) => ({ id: Number(row.id), giftNo: `MG${String(row.id).padStart(8, '0')}`, donorName: row.donor_nick_name || '喵伴用户', recipientName: row.recipient_name || '陪陪', giftName: row.gift_name, amount: Number(row.coin_cost || 0), createdAt: formatDate(row.created_at), blessing: row.blessing || '', broadcastOptIn: !!row.broadcast_opt_in, status: row.status, refundStatus: row.refund_status || '', canRequestRefund: row.status === 'valid' && !row.refund_status && Date.now() - new Date(row.created_at).getTime() <= 24 * 3600000 })) });
+  } catch (error) { console.error(error); send(res, 5001, null, '礼物订单读取失败'); }
+});
+
+app.get('/api/gifts/progress', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  try {
+    const [[totals]] = await pool.query("SELECT COALESCE(SUM(CASE WHEN created_at >= ? THEN coin_cost ELSE 0 END), 0) AS month_total, COALESCE(SUM(CASE WHEN created_at >= ? THEN coin_cost ELSE 0 END), 0) AS quarter_total FROM partner_gifts WHERE openid = ? AND status = 'valid'", [monthStart, quarterStart, userOpenid]);
+    send(res, 0, { monthTotal: Number(totals.month_total || 0), quarterTotal: Number(totals.quarter_total || 0), monthLabel: `${now.getFullYear()} 年 ${now.getMonth() + 1} 月`, quarterLabel: `${now.getFullYear()} 年第 ${Math.floor(now.getMonth() / 3) + 1} 季度` });
+  } catch (error) { console.error(error); send(res, 5001, null, '累计进度读取失败'); }
+});
+
+app.post('/api/gifts/:id/refund-request', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  const reason = String((req.body || {}).reason || '').trim();
+  if (!Number.isInteger(id) || id <= 0 || reason.length < 5 || reason.length > 300) return send(res, 4002, null, '请填写至少 5 个字的申请原因');
+  try {
+    const [[gift]] = await pool.query('SELECT id, created_at, status FROM partner_gifts WHERE id = ? AND openid = ?', [id, userOpenid]);
+    if (!gift || gift.status !== 'valid') return send(res, 4004, null, '礼物订单不存在或已失效');
+    if (Date.now() - new Date(gift.created_at).getTime() > 24 * 3600000) return send(res, 4002, null, '已超过 24 小时申请期限');
+    await pool.query('INSERT INTO gift_refund_requests (gift_id, openid, reason) VALUES (?, ?, ?)', [id, userOpenid, reason]);
+    send(res, 0, { status: 'pending' });
+  } catch (error) { if (error.code === 'ER_DUP_ENTRY') return send(res, 4002, null, '该礼物已提交过售后申请'); console.error(error); send(res, 5001, null, '售后申请提交失败'); }
 });
 
 app.post('/api/partners/:id/comments', async (req, res) => {
@@ -759,7 +849,8 @@ app.get('/api/coupons', async (req, res) => {
     const wallet = await ensureWallet(pool, userOpenid);
     await pool.query("UPDATE user_coupons SET status = 'expired' WHERE openid = ? AND status = 'unused' AND expires_at IS NOT NULL AND expires_at <= NOW()", [userOpenid]);
     const [coupons] = await pool.query("SELECT * FROM user_coupons WHERE openid = ? ORDER BY FIELD(status, 'unused', 'used', 'expired'), created_at DESC", [userOpenid]);
-    send(res, 0, { catFoodBalance: Number(wallet.cat_food_balance || 0), coupons: coupons.map(couponRow), exchangeOptions: CAT_FOOD_COUPON_OPTIONS });
+    const funWeeklyUsed = await weeklyFunCouponUsage(pool, userOpenid);
+    send(res, 0, { catFoodBalance: Number(wallet.cat_food_balance || 0), coupons: coupons.map(couponRow), exchangeOptions: CAT_FOOD_COUPON_OPTIONS, funWeeklyUsed, funWeeklyLimit: FUN_COUPON_WEEKLY_LIMIT });
   } catch (error) { console.error(error); send(res, 5001, null, '优惠券读取失败'); }
 });
 
@@ -779,13 +870,14 @@ app.get('/api/membership', async (req, res) => {
         membership.birthdayMessage = membership.birthdayEligible ? `生日月可领取 ${membership.birthdayGift} 猫粮` : '本年度生日月福利已领取';
       } else membership.birthdayMessage = '生日月可领取专属猫粮福利';
     }
-    send(res, 0, { membership, plans: Object.values(MEMBERSHIP_PLANS).map((plan) => ({ tier: plan.tier, name: plan.name, badge: plan.badge, price: plan.price, highlights: [`赠 ${plan.catFood} 猫粮`, `每月 ${plan.monthlyCoupons} 张${Math.round(plan.monthlyRate * 100)}折券`, `季度 ${Math.round(plan.quarterlyRate * 100)}折券`, plan.tier === 'svip' ? '优先安排服务' : '优先匹配服务', `生日月赠 ${plan.birthdayGift} 猫粮`, `可申请 ${plan.rescheduleCount} 次改期或换陪`, plan.crown, ...(plan.tier === 'svip' ? ['完成指定消费次数额外领9折券'] : [])] })) });
+    send(res, 0, { membership, purchaseEnabled: MEMBERSHIP_DEMO_ENABLED, plans: Object.values(MEMBERSHIP_PLANS).map((plan) => ({ tier: plan.tier, name: plan.name, badge: plan.badge, price: plan.price, highlights: [`赠 ${plan.catFood} 猫粮`, `每月 ${plan.monthlyCoupons} 张${discountLabel(plan.monthlyRate)}折券`, `季度 ${discountLabel(plan.quarterlyRate)}折券`, plan.tier === 'svip' ? '优先安排服务' : '优先匹配服务', `生日月赠 ${plan.birthdayGift} 猫粮`, `可申请 ${plan.rescheduleCount} 次改期或换陪`, plan.crown, ...(plan.tier === 'svip' ? ['完成指定消费次数额外领9折券'] : [])] })) });
   } catch (error) { console.error(error); send(res, 5001, null, '会员信息读取失败，请确认已执行会员数据库脚本'); }
 });
 
 app.post('/api/membership/subscribe', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
+  if (!MEMBERSHIP_DEMO_ENABLED) return send(res, 4003, null, '会员开通暂未接入支付，请联系客服');
   const tier = String((req.body || {}).tier || '');
   const plan = MEMBERSHIP_PLANS[tier];
   if (!plan) return send(res, 4002, null, '请选择有效会员套餐');
@@ -794,17 +886,41 @@ app.post('/api/membership/subscribe', async (req, res) => {
     await ensureUser(userOpenid);
     connection = await pool.getConnection(); await connection.beginTransaction();
     await ensureWallet(connection, userOpenid);
-    await connection.query(`INSERT INTO user_memberships (openid, tier, started_at, expires_at, monthly_coupon_cycle, quarterly_coupon_cycle)
-      VALUES (?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR), '', '')
-      ON DUPLICATE KEY UPDATE tier = VALUES(tier), started_at = NOW(), expires_at = DATE_ADD(IF(expires_at > NOW(), expires_at, NOW()), INTERVAL 1 YEAR), monthly_coupon_cycle = '', quarterly_coupon_cycle = ''`, [userOpenid, tier]);
-    const [[membership]] = await connection.query('SELECT * FROM user_memberships WHERE openid = ? FOR UPDATE', [userOpenid]);
-    await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance + ? WHERE openid = ?', [plan.catFood, userOpenid]);
-    await addWalletRecord(connection, userOpenid, { catFoodDelta: plan.catFood, type: 'membership_join', title: `${plan.name}入会赠送猫粮`, amount: plan.price });
-    await queueGrowth(connection, userOpenid, plan.price, 'membership_purchase', `${plan.name}会员购买成长值`, null, 0);
+    const [[currentMembership]] = await connection.query('SELECT * FROM user_memberships WHERE openid = ? FOR UPDATE', [userOpenid]);
+    const currentActive = membershipView(currentMembership).active;
+    if (currentActive && currentMembership.tier === 'svip' && tier === 'vip') {
+      await connection.rollback();
+      return send(res, 4002, null, 'SVIP有效期内不能开通VIP，请选择续费SVIP');
+    }
+    const upgrading = currentActive && currentMembership.tier === 'vip' && tier === 'svip';
+    const chargedAmount = upgrading ? MEMBERSHIP_PLANS.svip.price - MEMBERSHIP_PLANS.vip.price : plan.price;
+    const grantedCatFood = upgrading ? MEMBERSHIP_PLANS.svip.catFood - MEMBERSHIP_PLANS.vip.catFood : plan.catFood;
+    let membership;
+    let grantedCoupons;
+    if (upgrading) {
+      await connection.query('UPDATE user_memberships SET tier = ? WHERE openid = ?', [tier, userOpenid]);
+      grantedCoupons = await upgradeMembershipCoupons(connection, userOpenid);
+      const cycles = cycleKeys();
+      await connection.query('UPDATE user_memberships SET monthly_coupon_cycle = ?, quarterly_coupon_cycle = ? WHERE openid = ?', [cycles.month, cycles.quarter, userOpenid]);
+      membership = { ...currentMembership, tier, monthly_coupon_cycle: cycles.month, quarterly_coupon_cycle: cycles.quarter };
+    } else {
+      if (!currentMembership) {
+        await connection.query("INSERT INTO user_memberships (openid, tier, started_at, expires_at, monthly_coupon_cycle, quarterly_coupon_cycle) VALUES (?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR), '', '')", [userOpenid, tier]);
+      } else if (currentActive && currentMembership.tier === tier) {
+        await connection.query('UPDATE user_memberships SET expires_at = DATE_ADD(expires_at, INTERVAL 1 YEAR) WHERE openid = ?', [userOpenid]);
+      } else {
+        await connection.query("UPDATE user_memberships SET tier = ?, started_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL 1 YEAR), monthly_coupon_cycle = '', quarterly_coupon_cycle = '' WHERE openid = ?", [tier, userOpenid]);
+      }
+      const [[updatedMembership]] = await connection.query('SELECT * FROM user_memberships WHERE openid = ? FOR UPDATE', [userOpenid]);
+      membership = updatedMembership;
+      grantedCoupons = await issueRecurringMembershipCoupons(connection, membership);
+    }
+    await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance + ? WHERE openid = ?', [grantedCatFood, userOpenid]);
+    await addWalletRecord(connection, userOpenid, { catFoodDelta: grantedCatFood, type: upgrading ? 'membership_upgrade' : 'membership_join', title: upgrading ? 'VIP补差价升级SVIP猫粮差额' : `${plan.name}入会赠送猫粮`, amount: chargedAmount });
+    await queueGrowth(connection, userOpenid, chargedAmount, 'membership_purchase', upgrading ? 'VIP补差价升级SVIP成长值' : `${plan.name}会员购买成长值`, null, 0);
     await settleGrowth(connection, userOpenid);
-    const grantedCoupons = await issueRecurringMembershipCoupons(connection, membership);
     await connection.commit();
-    send(res, 0, { membership: membershipView(membership), grantedCatFood: plan.catFood, grantedCoupons });
+    send(res, 0, { membership: membershipView(membership), chargedAmount, upgraded: upgrading, grantedCatFood, grantedCoupons });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '会员开通失败，请确认已执行会员数据库脚本'); }
   finally { if (connection) connection.release(); }
 });
@@ -842,10 +958,6 @@ app.post('/api/coupons/exchange', async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
     await ensureWallet(connection, userOpenid);
-    const [[daily]] = await connection.query("SELECT COUNT(*) AS total FROM user_coupons WHERE openid = ? AND source = 'cat_food_exchange' AND DATE(created_at) = CURDATE()", [userOpenid]);
-    if (Number(daily.total || 0) >= 2) { await connection.rollback(); return send(res, 4002, null, '每个账号每天最多兑换 2 张优惠券'); }
-    const [[weekly]] = await connection.query("SELECT COUNT(*) AS total FROM user_coupons WHERE openid = ? AND source = 'cat_food_exchange' AND YEARWEEK(created_at, 1) = YEARWEEK(CURDATE(), 1)", [userOpenid]);
-    if (Number(weekly.total || 0) >= 5) { await connection.rollback(); return send(res, 4002, null, '每个账号每周最多兑换 5 张优惠券'); }
     const [result] = await connection.query('UPDATE user_wallets SET cat_food_balance = cat_food_balance - ? WHERE openid = ? AND cat_food_balance >= ?', [option.cost, userOpenid, option.cost]);
     if (!result.affectedRows) { await connection.rollback(); return send(res, 4002, null, '猫粮余额不足'); }
     const [couponResult] = await connection.query("INSERT INTO user_coupons (openid, amount, min_order_amount, cat_food_cost, coupon_type, coupon_name, source, status, expires_at) VALUES (?, ?, ?, ?, 'fixed', ?, 'cat_food_exchange', 'unused', DATE_ADD(NOW(), INTERVAL 7 DAY))", [userOpenid, option.amount, option.threshold, option.cost, `满${option.threshold}减${option.amount}猫粮券`]);
@@ -898,11 +1010,11 @@ app.get('/api/points', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   try {
-    const [walletRows] = await pool.query("SELECT id, title, transaction_type, cat_food_delta, amount, created_at FROM wallet_transactions WHERE openid = ? AND cat_food_delta <> 0 ORDER BY created_at DESC LIMIT 100", [userOpenid]);
+    const [walletRows] = await pool.query("SELECT id, title, transaction_type, cat_food_delta, amount, order_id, created_at FROM wallet_transactions WHERE openid = ? AND cat_food_delta <> 0 ORDER BY created_at DESC LIMIT 100", [userOpenid]);
     const [rows] = walletRows.length ? [walletRows] : await pool.query("SELECT id, partner_name, service, total_price, points_earned, status, created_at FROM orders WHERE openid = ? AND status <> 'cancelled' AND points_earned > 0 ORDER BY created_at DESC LIMIT 100", [userOpenid]);
     const wallet = await ensureWallet(pool, userOpenid);
     const balance = Number(wallet.cat_food_balance || 0);
-    send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, partnerName: item.title || item.partner_name || '陪陪订单', service: item.transaction_type || item.service || '订单消费', amount: Number(item.amount || item.total_price || 0), points: Number(item.cat_food_delta === undefined ? item.points_earned : item.cat_food_delta || 0), createdAt: formatDate(item.created_at) })) });
+    send(res, 0, { balance, records: rows.map((item) => ({ id: item.id, recordNo: item.cat_food_delta === undefined ? String(item.id) : `ML${String(item.id).padStart(8, '0')}`, orderId: item.order_id || '', partnerName: item.title || item.partner_name || '陪陪订单', service: item.transaction_type || item.service || '订单消费', amount: Number(item.amount || item.total_price || 0), points: Number(item.cat_food_delta === undefined ? item.points_earned : item.cat_food_delta || 0), createdAt: formatDate(item.created_at) })) });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '猫粮记录读取失败');
@@ -918,26 +1030,47 @@ app.post('/api/orders', async (req, res) => {
   const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
   const originalTotalPrice = money(body.totalPrice);
   const couponId = Number(body.couponId);
+  const orderQuantity = Number(body.quantity);
+  const valorantFunModes = { 'val-fun-silent': ['静音雷达局', 65], 'val-fun-dialect': ['方言捕捉局', 65], 'val-fun-ace': ['王牌加时局', 65], 'val-fun-duo': ['特工搭档局', 60], 'val-fun-lines': ['特工台词局', 60], 'val-fun-contract': ['猫猫平行宇宙局', 65] };
+  const funMode = valorantFunModes[body.funId];
+  if (!Number.isInteger(orderQuantity) || orderQuantity < 1 || !['小时', '局'].includes(body.unit) ||
+      (body.unit === '小时' ? body.priceMode !== 'hour' : body.priceMode !== 'game') || originalTotalPrice <= 0) {
+    return send(res, 4002, null, '下单数量或服务原价无效');
+  }
+  if (body.funId && (!funMode || body.service !== `无畏契约趣味单·${funMode[0]}` || body.unit !== '小时' || body.priceMode !== 'hour' || originalTotalPrice !== money(funMode[1] * orderQuantity))) {
+    return send(res, 4002, null, '趣味单玩法或金额无效，请重新选择');
+  }
   const pointsEarned = 0;
   let connection;
   try {
     await ensureUser(userOpenid);
     const requestedPartnerId = Number(body.partnerId);
     let partnerProfileId = null;
+    let partnerPrice = null;
     if (Number.isInteger(requestedPartnerId) && requestedPartnerId > 0) {
-      const [[partner]] = await pool.query("SELECT id FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
-      if (partner) partnerProfileId = partner.id;
+      const [[partner]] = await pool.query("SELECT id, hour_price, game_price FROM partner_profiles WHERE id = ? AND status = 'approved'", [requestedPartnerId]);
+      if (partner) {
+        partnerProfileId = partner.id;
+        partnerPrice = money((funMode ? funMode[1] : (body.unit === '小时' ? partner.hour_price : partner.game_price)) * orderQuantity);
+      }
+      else return send(res, 4002, null, '陪陪已下架，请返回重新选择');
+    }
+    if (couponId > 0 && partnerPrice !== null && originalTotalPrice !== partnerPrice) {
+      return send(res, 4002, null, '服务原价已变化，请返回重新选择后使用优惠券');
     }
     connection = await pool.getConnection();
     await connection.beginTransaction();
+    if (couponId > 0) await connection.query('SELECT openid FROM users WHERE openid = ? FOR UPDATE', [userOpenid]);
     let coupon = null;
     if (Number.isInteger(couponId) && couponId > 0) {
       const [[row]] = await connection.query("SELECT * FROM user_coupons WHERE id = ? AND openid = ? AND status = 'unused' AND (expires_at IS NULL OR expires_at > NOW()) FOR UPDATE", [couponId, userOpenid]);
       if (!row) { await connection.rollback(); return send(res, 4002, null, '优惠券不可用或已使用'); }
-      if (row.coupon_name === '趣味单体验券' && !String(body.service || '').includes('趣味')) { await connection.rollback(); return send(res, 4002, null, '趣味单体验券仅限趣味单使用'); }
+      const couponError = couponOrderError(row, body.orderScene, String(body.service || ''), String(body.paymentMethod || ''), body.unit, body.quantity);
+      if (couponError) { await connection.rollback(); return send(res, 4002, null, couponError); }
+      if (/趣味/.test(String(body.service || '')) && await weeklyFunCouponUsage(connection, userOpenid) >= FUN_COUPON_WEEKLY_LIMIT) {
+        await connection.rollback(); return send(res, 4002, null, '本周趣味单已使用 2 张优惠券，下周可继续使用');
+      }
       if (Number(row.min_order_amount || 0) > originalTotalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需订单原价满 ¥${money(row.min_order_amount)} 才可使用`); }
-      if (row.source === 'cat_food_exchange' && body.unit === '小时' && Number(body.quantity || 0) < 1) { await connection.rollback(); return send(res, 4002, null, '按时长订单满 60 分钟才可使用猫粮优惠券'); }
-      if (row.source === 'cat_food_exchange' && ['special', 'group', 'agent', 'activity'].includes(String(body.orderScene || 'regular'))) { await connection.rollback(); return send(res, 4002, null, '猫粮优惠券仅适用于常规点单'); }
       coupon = row;
     }
     const couponDiscount = money(!coupon ? 0 : (coupon.coupon_type === 'discount' && Number(coupon.discount_rate || 0) > 0 && Number(coupon.discount_rate || 0) < 1
@@ -976,8 +1109,11 @@ app.post('/api/orders/:id/renew', async (req, res) => {
   if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) return send(res, 4002, null, '请输入有效的续单数量');
   let connection;
   try {
-    const [[source]] = await pool.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND ((status = 'progress' AND service_completed_at IS NULL) OR (status = 'completed' AND service_completed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)))", [req.params.id, userOpenid]);
-    if (!source) return send(res, 4004, null, '续单需在原订单结束后 24 小时内发起');
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    if (couponId > 0) await connection.query('SELECT openid FROM users WHERE openid = ? FOR UPDATE', [userOpenid]);
+    const [[source]] = await connection.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND ((status = 'progress' AND service_completed_at IS NULL) OR (status = 'completed' AND service_completed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR))) FOR UPDATE", [req.params.id, userOpenid]);
+    if (!source) { await connection.rollback(); return send(res, 4004, null, '续单需在原订单结束后 24 小时内发起'); }
     const renewUnit = requestedUnit;
     const maxQuantity = renewUnit === '局' ? 99 : 24;
     const quantity = Math.min(requestedQuantity, maxQuantity);
@@ -986,16 +1122,21 @@ app.post('/api/orders/:id/renew', async (req, res) => {
     const unitPrice = money(baseAmount / sourceQuantity);
     const totalPrice = money(unitPrice * quantity);
     const id = `MB${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
     let coupon = null;
     let couponDiscount = 0;
     if (Number.isInteger(couponId) && couponId > 0) {
-      if (!source.service_completed_at) { await connection.rollback(); return send(res, 4002, null, '续单优惠券需在原订单结束后 24 小时内使用'); }
-      const [[usedRenewCoupon]] = await connection.query('SELECT id FROM orders WHERE renew_from_order_id = ? AND coupon_id IS NOT NULL LIMIT 1 FOR UPDATE', [source.id]);
+      if (source.status !== 'completed' || !source.service_completed_at) { await connection.rollback(); return send(res, 4002, null, '原订单正常结单后才可使用续单优惠券'); }
+      const [[pendingRefund]] = await connection.query("SELECT id FROM refund_requests WHERE order_id = ? AND status = 'pending' LIMIT 1 FOR UPDATE", [source.id]);
+      if (pendingRefund) { await connection.rollback(); return send(res, 4002, null, '原订单处于售后中，暂不可使用续单优惠券'); }
+      const [[usedRenewCoupon]] = await connection.query("SELECT id FROM orders WHERE (renew_from_order_id = ? OR (renew_from_order_id IS NULL AND remark LIKE ?)) AND coupon_id IS NOT NULL LIMIT 1 FOR UPDATE", [source.id, '续自订单 ' + source.id + ' ·%']);
       if (usedRenewCoupon) { await connection.rollback(); return send(res, 4002, null, '每个原订单仅限使用 1 张续单优惠券'); }
       const [[row]] = await connection.query("SELECT * FROM user_coupons WHERE id = ? AND openid = ? AND status = 'unused' AND (expires_at IS NULL OR expires_at > NOW()) FOR UPDATE", [couponId, userOpenid]);
       if (!row) { await connection.rollback(); return send(res, 4002, null, '优惠券不可用或已过期'); }
+      const couponError = couponOrderError(row, /趣味/.test(source.service) ? 'fun' : 'regular', String(source.service || ''), String(source.payment_method || ''), renewUnit, quantity);
+      if (couponError) { await connection.rollback(); return send(res, 4002, null, couponError); }
+      if (/趣味/.test(String(source.service || '')) && await weeklyFunCouponUsage(connection, userOpenid) >= FUN_COUPON_WEEKLY_LIMIT) {
+        await connection.rollback(); return send(res, 4002, null, '本周趣味单已使用 2 张优惠券，下周可继续使用');
+      }
       if (Number(row.min_order_amount || 0) > totalPrice) { await connection.rollback(); return send(res, 4002, null, `该优惠券需续单原价满 ¥${money(row.min_order_amount)} 才可使用`); }
       if (renewUnit === '小时' && quantity < 1) { await connection.rollback(); return send(res, 4002, null, '按时长续单满 60 分钟才可使用优惠券'); }
       coupon = row;
@@ -1004,10 +1145,10 @@ app.post('/api/orders/:id/renew', async (req, res) => {
     const payablePrice = money(totalPrice - couponDiscount);
     await connection.query(
       `INSERT INTO orders (id, openid, partner_profile_id, partner_name, partner_tag, partner_initial, partner_color, partner_avatar_url, partner_gender, partner_rank_text, service,
-        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, points_earned, payment_method, remark, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '立即开始', ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, 'pending')`,
+        start_time, quantity, unit, price_mode, total_price, original_total_price, cat_food_used, coupon_discount, coupon_id, renew_from_order_id, points_earned, payment_method, remark, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '立即开始', ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?, 'pending')`,
       [id, userOpenid, source.partner_profile_id, source.partner_name, source.partner_tag, source.partner_initial, source.partner_color, source.partner_avatar_url, source.partner_gender, source.partner_rank_text, source.service,
-         quantity, renewUnit, renewUnit === '局' ? 'game' : 'hour', payablePrice, totalPrice, couponDiscount, coupon ? coupon.id : null, source.payment_method, `续自订单 ${source.id} · 按${renewUnit}续单`]
+         quantity, renewUnit, renewUnit === '局' ? 'game' : 'hour', payablePrice, totalPrice, couponDiscount, coupon ? coupon.id : null, source.id, source.payment_method, `续自订单 ${source.id} · 按${renewUnit}续单`]
     );
     if (coupon) await connection.query("UPDATE user_coupons SET status = 'used', used_order_id = ?, used_at = NOW() WHERE id = ?", [id, coupon.id]);
     await connection.commit();
@@ -1020,17 +1161,31 @@ app.post('/api/orders/:id/renew', async (req, res) => {
 app.patch('/api/orders/:id/cancel', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
+  let connection;
   try {
-    const [result] = await pool.query(
-      "UPDATE orders SET status = 'cancelled' WHERE id = ? AND openid = ? AND status IN ('pending', 'progress')",
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[order]] = await connection.query(
+      "SELECT * FROM orders WHERE id = ? AND openid = ? AND status IN ('pending', 'progress') FOR UPDATE",
       [req.params.id, userOpenid]
     );
-    if (!result.affectedRows) return send(res, 4004, null, '订单不存在或当前不可取消');
-    send(res, 0, { id: req.params.id, status: 'cancelled' });
+    if (!order) { await connection.rollback(); return send(res, 4004, null, '订单不存在或当前不可取消'); }
+    await connection.query("UPDATE orders SET status = 'cancelled' WHERE id = ?", [order.id]);
+    let couponReturned = false;
+    if (order.coupon_id && !order.service_started_at) {
+      const [result] = await connection.query(
+        "UPDATE user_coupons SET status = 'unused', used_order_id = NULL, used_at = NULL WHERE id = ? AND openid = ? AND status = 'used' AND used_order_id = ? AND (expires_at IS NULL OR expires_at > NOW())",
+        [order.coupon_id, userOpenid, order.id]
+      );
+      couponReturned = result.affectedRows > 0;
+    }
+    await connection.commit();
+    send(res, 0, { id: order.id, status: 'cancelled', couponReturned });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error(error);
     send(res, 5001, null, '订单取消失败');
-  }
+  } finally { if (connection) connection.release(); }
 });
 
 app.post('/api/orders/:id/refund-direct-disabled', async (req, res) => {
@@ -1057,11 +1212,19 @@ app.post('/api/orders/:id/refund-direct-disabled', async (req, res) => {
       "UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?",
       [` [已退款：¥${refundAmount}，扣回${catFoodToDeduct}猫粮]`, order.id]
     );
+    let couponReturned = false;
+    if (order.coupon_id && !order.service_started_at) {
+      const [couponResult] = await connection.query(
+        "UPDATE user_coupons SET status = 'unused', used_order_id = NULL, used_at = NULL WHERE id = ? AND openid = ? AND status = 'used' AND used_order_id = ? AND (expires_at IS NULL OR expires_at > NOW())",
+        [order.coupon_id, userOpenid, order.id]
+      );
+      couponReturned = couponResult.affectedRows > 0;
+    }
     await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance - ? WHERE openid = ?', [refundAmount, catFoodToDeduct, userOpenid]);
     await addWalletRecord(connection, userOpenid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（返还金币、扣回猫粮）', amount: refundAmount, orderId: order.id });
     await connection.commit();
     const [[updatedOrder]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [order.id, userOpenid]);
-    send(res, 0, { order: orderRow(updatedOrder), refundAmount, catFoodToDeduct });
+    send(res, 0, { order: orderRow(updatedOrder), refundAmount, catFoodToDeduct, couponReturned });
   } catch (error) {
     if (connection) await connection.rollback();
     console.error(error);
@@ -1264,25 +1427,39 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
       FROM orders WHERE id = ? AND openid = ? FOR UPDATE`, [refund.order_id, refund.openid]);
     if (!order || order.status === 'cancelled') { await connection.rollback(); return send(res, 4004, null, '订单不存在或已退款'); }
     let refundAmount = 0;
+    const paidAmount = money(order.total_price);
+    const originalAmount = money(order.original_total_price === null ? order.total_price : order.original_total_price);
     const seconds = Math.max(0, Number(order.service_seconds || 0));
-    if (order.unit === '小时') {
-      if (!order.service_started_at || seconds < 28 * 60) { await connection.rollback(); return send(res, 4002, null, '服务时长不足 28 分钟，不满足退款规则'); }
+    if (!order.service_started_at) {
+      refundAmount = paidAmount;
+    } else if (order.unit === '小时') {
+      if (seconds < 28 * 60) { await connection.rollback(); return send(res, 4002, null, '服务时长不足 28 分钟，不满足退款规则'); }
       if (seconds > 60 * 60) { await connection.rollback(); return send(res, 4002, null, '服务时长已超过 1 小时，请人工协商处理'); }
-      const hourlyPrice = money(Number(order.original_total_price === null ? order.total_price : order.original_total_price) / Math.max(1, Number(order.quantity || 1)));
-      refundAmount = money(hourlyPrice * (seconds < 57 * 60 ? 0.5 : 1));
+      const hourlyPrice = money(originalAmount / Math.max(1, Number(order.quantity || 1)));
+      const grossRefund = money(hourlyPrice * (seconds < 57 * 60 ? 0.5 : 1));
+      refundAmount = money(Math.min(paidAmount, grossRefund * (originalAmount > 0 ? paidAmount / originalAmount : 0)));
     } else {
-      refundAmount = money(order.total_price);
+      await connection.rollback();
+      return send(res, 4002, null, '按局订单已开始服务，需核对已完成局数后人工计算退款金额');
     }
     const catFoodToDeduct = Math.max(0, Number(order.points_earned || 0));
     await ensureWallet(connection, refund.openid);
     const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [refund.openid]);
     if (Number(wallet.cat_food_balance || 0) < catFoodToDeduct) { await connection.rollback(); return send(res, 4002, null, `用户猫粮余额不足，需扣回 ${catFoodToDeduct} 猫粮`); }
     await connection.query("UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：¥${refundAmount}，原路退回（演示），扣回${catFoodToDeduct}猫粮]`, order.id]);
+    let couponReturned = false;
+    if (order.coupon_id && !order.service_started_at) {
+      const [couponResult] = await connection.query(
+        "UPDATE user_coupons SET status = 'unused', used_order_id = NULL, used_at = NULL WHERE id = ? AND openid = ? AND status = 'used' AND used_order_id = ? AND (expires_at IS NULL OR expires_at > NOW())",
+        [order.coupon_id, refund.openid, order.id]
+      );
+      couponReturned = couponResult.affectedRows > 0;
+    }
     await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance - ? WHERE openid = ?', [refundAmount, catFoodToDeduct, refund.openid]);
     await addWalletRecord(connection, refund.openid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（原路退款演示）', amount: refundAmount, orderId: order.id });
     await connection.query("UPDATE refund_requests SET status = 'refunded', refund_amount = ?, cat_food_to_deduct = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [refundAmount, catFoodToDeduct, reviewerOpenid, id]);
     await connection.commit();
-    send(res, 0, { id, status: 'refunded', refundAmount, catFoodToDeduct, refundRoute: order.payment_method || '原支付路径（演示）' });
+    send(res, 0, { id, status: 'refunded', refundAmount, catFoodToDeduct, couponReturned, refundRoute: order.payment_method || '原支付路径（演示）' });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '退款审核处理失败'); }
   finally { if (connection) connection.release(); }
 });
