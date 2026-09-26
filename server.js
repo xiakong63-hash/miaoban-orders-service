@@ -3,6 +3,7 @@ const express = require('express');
 const mysql = require('mysql2/promise');
 const { FUN_COUPON_WEEKLY_LIMIT, weeklyFunCouponUsage } = require('./fun-coupon-limit');
 const PARTNER_GIFTS = require('./gift-catalog');
+const { TEMPLATE_ID: ORDER_NOTICE_TEMPLATE_ID, noticeEnabled, sendOrderNotice } = require('./order-notice');
 const MEMBERSHIP_DEMO_ENABLED = process.env.MEMBERSHIP_DEMO_ENABLED === 'true';
 
 const app = express();
@@ -477,6 +478,27 @@ async function requireApprovedPartner(req, res) {
   const [[partner]] = await pool.query("SELECT * FROM partner_profiles WHERE openid = ? AND status = 'approved'", [userOpenid]);
   if (!partner) { send(res, 4031, null, '仅已通过审核的陪玩可使用接单大厅'); return null; }
   return partner;
+}
+
+app.get('/api/partner/order-notice', async (req, res) => {
+  try {
+    const partner = await requireApprovedPartner(req, res);
+    if (!partner) return;
+    send(res, 0, { enabled: noticeEnabled(), templateId: ORDER_NOTICE_TEMPLATE_ID });
+  } catch (error) {
+    console.error(error);
+    send(res, 5001, null, '接单提醒配置读取失败');
+  }
+});
+
+async function notifyPartnerForOrder(order) {
+  if (!noticeEnabled() || !order || !order.partner_profile_id) return;
+  try {
+    const [[partner]] = await pool.query("SELECT openid FROM partner_profiles WHERE id = ? AND status = 'approved'", [order.partner_profile_id]);
+    if (partner && partner.openid) await sendOrderNotice(partner.openid, order);
+  } catch (error) {
+    console.error(`订单 ${order.id} 接单提醒发送失败:`, error.message);
+  }
 }
 
 app.get('/api/partner/orders', async (req, res) => {
@@ -1228,6 +1250,7 @@ app.post('/api/orders', async (req, res) => {
     await connection.commit();
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
     send(res, 0, { order: orderRow(order) });
+    void notifyPartnerForOrder(order);
   } catch (error) {
     if (connection) await connection.rollback();
     console.error(error);
@@ -1293,6 +1316,7 @@ app.post('/api/orders/:id/renew', async (req, res) => {
     await connection.commit();
     const [[order]] = await pool.query('SELECT * FROM orders WHERE id = ? AND openid = ?', [id, userOpenid]);
     send(res, 0, { order: orderRow(order) });
+    void notifyPartnerForOrder(order);
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '续单创建失败'); }
   finally { if (connection) connection.release(); }
 });
