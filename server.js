@@ -1366,6 +1366,34 @@ app.get('/api/refund-requests/:id', async (req, res) => {
   } catch (error) { console.error(error); send(res, 5001, null, '退款详情读取失败'); }
 });
 
+app.post('/api/refund-requests/:id/evidence', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const id = Number(req.params.id);
+  const additions = Array.isArray((req.body || {}).evidence) ? (req.body || {}).evidence : [];
+  if (!Number.isInteger(id) || id <= 0 || !additions.length || additions.length > 3 || additions.some((item) => typeof item !== 'string' || !item.startsWith('cloud://') || item.length > 512)) return send(res, 4002, null, '请上传 1 至 3 张有效截图');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [[row]] = await connection.query('SELECT evidence_json, status FROM refund_requests WHERE id = ? AND openid = ? FOR UPDATE', [id, userOpenid]);
+    if (!row) { await connection.rollback(); return send(res, 4004, null, '退款申请不存在'); }
+    if (row.status !== 'pending') { await connection.rollback(); return send(res, 4002, null, '申请已结束审核，无法补充凭据'); }
+    let existing;
+    try { existing = JSON.parse(row.evidence_json || '[]'); } catch (_) { existing = []; }
+    if (!Array.isArray(existing)) existing = [];
+    if (existing.length + additions.length > 6) { await connection.rollback(); return send(res, 4002, null, '申请凭据最多 6 张'); }
+    const evidence = existing.concat(additions);
+    await connection.query('UPDATE refund_requests SET evidence_json = ? WHERE id = ?', [JSON.stringify(evidence), id]);
+    await connection.commit();
+    send(res, 0, { evidence });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error(error);
+    send(res, 5001, null, '补充凭据失败');
+  } finally { if (connection) connection.release(); }
+});
+
 app.get('/api/admin/order-ledger', async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const type = String(req.query.type || 'service');
