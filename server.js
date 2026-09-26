@@ -1220,20 +1220,22 @@ app.post('/api/orders', async (req, res) => {
 app.post('/api/orders/:id/renew', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
-  const requestedQuantity = Math.floor(Number((req.body || {}).quantity));
-  const requestedUnit = (req.body || {}).unit === '局' ? '局' : '小时';
+  const requestedQuantity = Number((req.body || {}).quantity);
+  const requestedUnit = (req.body || {}).unit;
   const couponId = Number((req.body || {}).couponId);
-  if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) return send(res, 4002, null, '请输入有效的续单数量');
+  if (!Number.isInteger(requestedQuantity) || requestedQuantity < 1 || !['小时', '局'].includes(requestedUnit)) return send(res, 4002, null, '请输入有效的续单数量和计费方式');
   let connection;
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
     if (couponId > 0) await connection.query('SELECT openid FROM users WHERE openid = ? FOR UPDATE', [userOpenid]);
     const [[source]] = await connection.query("SELECT * FROM orders WHERE id = ? AND openid = ? AND ((status = 'progress' AND service_completed_at IS NULL) OR (status = 'completed' AND service_completed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR))) FOR UPDATE", [req.params.id, userOpenid]);
-    if (!source) { await connection.rollback(); return send(res, 4004, null, '续单需在原订单结束后 24 小时内发起'); }
+    if (!source) { await connection.rollback(); return send(res, 4004, null, '仅服务进行中或结单后 24 小时内可续单'); }
+    if (requestedUnit !== source.unit) { await connection.rollback(); return send(res, 4002, null, '续单须沿用原订单计费方式；更换方式请重新下单'); }
     const renewUnit = requestedUnit;
     const maxQuantity = renewUnit === '局' ? 99 : 24;
-    const quantity = Math.min(requestedQuantity, maxQuantity);
+    if (requestedQuantity > maxQuantity) { await connection.rollback(); return send(res, 4002, null, `单次最多续 ${maxQuantity}${renewUnit}`); }
+    const quantity = requestedQuantity;
     const sourceQuantity = Math.max(1, Number(source.quantity || 1));
     const baseAmount = Number(source.original_total_price === null || source.original_total_price === undefined ? source.total_price : source.original_total_price);
     const unitPrice = money(baseAmount / sourceQuantity);
