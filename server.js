@@ -483,8 +483,8 @@ app.get('/api/partner/orders', async (req, res) => {
   try {
     const partner = await requireApprovedPartner(req, res);
     if (!partner) return;
-    const [rows] = await pool.query("SELECT * FROM orders WHERE partner_profile_id = ? AND status IN ('pending', 'progress') ORDER BY created_at DESC", [partner.id]);
-    send(res, 0, { orders: rows.map(orderRow) });
+    const [rows] = await pool.query("SELECT o.*, u.nick_name AS customer_name, u.user_no AS customer_no FROM orders o LEFT JOIN users u ON u.openid = o.openid WHERE o.partner_profile_id = ? AND o.status IN ('pending', 'progress') ORDER BY o.created_at DESC", [partner.id]);
+    send(res, 0, { orders: rows.map((row) => ({ ...orderRow(row), customerName: row.customer_name || '顾客', customerNo: row.customer_no || '' })) });
   } catch (error) {
     console.error(error);
     send(res, 5001, null, '接单大厅读取失败');
@@ -947,9 +947,20 @@ app.get('/api/wallet', async (req, res) => {
       balance: money(wallet.coin_balance),
       catFoodBalance: Number(wallet.cat_food_balance || 0),
       records: records.map((row) => ({ id: row.id, title: row.title, coinDelta: money(row.coin_delta), catFoodDelta: Number(row.cat_food_delta || 0), createdAt: formatDate(row.created_at) })),
-      withdrawals: withdrawals.map((row) => ({ id: row.id, amount: money(row.amount), status: row.status, createdAt: formatDate(row.created_at) }))
+      withdrawals: withdrawals.map((row) => ({ id: row.id, amount: money(row.amount), feeAmount: row.fee_amount === null ? null : money(row.fee_amount), payoutAmount: row.payout_amount === null ? null : money(row.payout_amount), status: row.status, createdAt: formatDate(row.created_at) }))
     });
   } catch (error) { console.error(error); send(res, 5001, null, '金币钱包读取失败'); }
+});
+
+app.get('/api/wallet/coin-records', async (req, res) => {
+  const userOpenid = requireOpenid(req, res);
+  if (!userOpenid) return;
+  const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1));
+  const pageSize = 30;
+  try {
+    const [rows] = await pool.query('SELECT id, title, transaction_type, coin_delta, amount, order_id, created_at FROM wallet_transactions WHERE openid = ? AND coin_delta <> 0 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?', [userOpenid, pageSize + 1, (page - 1) * pageSize]);
+    send(res, 0, { records: rows.slice(0, pageSize).map((row) => ({ id: Number(row.id), title: row.title || '金币变动', type: row.transaction_type || '', coinDelta: money(row.coin_delta), amount: money(row.amount), orderId: row.order_id || '', createdAt: formatDate(row.created_at) })), hasMore: rows.length > pageSize, page });
+  } catch (error) { console.error(error); send(res, 5001, null, '金币明细读取失败'); }
 });
 
 app.get('/api/coupons', async (req, res) => {
@@ -1082,22 +1093,31 @@ app.post('/api/wallet/recharge', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   const amount = money(req.body && req.body.amount);
-  const gifts = { 6: 0, 30: 1, 68: 4, 128: 10 };
-  if (!Object.prototype.hasOwnProperty.call(gifts, amount)) return send(res, 4002, null, '请选择有效充值档位');
+  const packages = [6, 30, 98, 198, 328, 648];
+  if (!packages.includes(amount)) return send(res, 4002, null, '请选择有效充值档位');
+  let connection;
   try {
-    await ensureWallet(pool, userOpenid);
-    await pool.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance + ? WHERE openid = ?', [amount, gifts[amount], userOpenid]);
-    await addWalletRecord(pool, userOpenid, { coinDelta: amount, catFoodDelta: gifts[amount], type: 'recharge_demo', title: `充值 ¥${amount}`, amount });
-    const wallet = await ensureWallet(pool, userOpenid);
-    send(res, 0, { balance: money(wallet.coin_balance), catFoodGift: gifts[amount] });
-  } catch (error) { console.error(error); send(res, 5001, null, '充值处理失败'); }
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    await ensureWallet(connection, userOpenid);
+    await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ? WHERE openid = ?', [amount, userOpenid]);
+    await addWalletRecord(connection, userOpenid, { coinDelta: amount, catFoodDelta: 0, type: 'recharge_demo', title: `演示充值 ¥${amount} · 无赠送`, amount });
+    const [[wallet]] = await connection.query('SELECT coin_balance FROM user_wallets WHERE openid = ?', [userOpenid]);
+    await connection.commit();
+    send(res, 0, { balance: money(wallet.coin_balance), catFoodGift: 0, bonusCoins: 0, demo: true });
+  } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '充值处理失败'); }
+  finally { if (connection) connection.release(); }
 });
 
 app.post('/api/wallet/withdrawals', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
-  const amount = money(req.body && req.body.amount);
-  if (!amount || amount < 10) return send(res, 4002, null, '单次提现至少 10 金币');
+  const rawAmount = String((req.body || {}).amount === undefined ? '' : req.body.amount);
+  if (!/^\d+(\.\d{1,2})?$/.test(rawAmount)) return send(res, 4002, null, '提现金额最多保留两位小数');
+  const amount = money(rawAmount);
+  if (!Number.isFinite(amount) || amount < 10) return send(res, 4002, null, '单次提现至少 10 金币');
+  const feeAmount = money(amount * 0.1);
+  const payoutAmount = money(amount - feeAmount);
   let connection;
   try {
     connection = await pool.getConnection();
@@ -1107,11 +1127,11 @@ app.post('/api/wallet/withdrawals', async (req, res) => {
     const [result] = await connection.query('UPDATE user_wallets SET coin_balance = coin_balance - ? WHERE openid = ? AND coin_balance >= ?', [amount, userOpenid, amount]);
     if (!result.affectedRows) { await connection.rollback(); return send(res, 4002, null, '金币余额不足'); }
     const balanceAfter = money(balanceBefore - amount);
-    await connection.query("INSERT INTO withdrawal_requests (openid, amount, balance_before, balance_after, status) VALUES (?, ?, ?, ?, 'pending')", [userOpenid, amount, balanceBefore, balanceAfter]);
-    await addWalletRecord(connection, userOpenid, { coinDelta: -amount, type: 'withdrawal', title: '提现申请（待处理）', amount });
+    await connection.query("INSERT INTO withdrawal_requests (openid, amount, fee_amount, payout_amount, balance_before, balance_after, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')", [userOpenid, amount, feeAmount, payoutAmount, balanceBefore, balanceAfter]);
+    await addWalletRecord(connection, userOpenid, { coinDelta: -amount, type: 'withdrawal', title: `提现申请（手续费 ${feeAmount}，预计到账 ${payoutAmount}）`, amount });
     await connection.commit();
     const wallet = await ensureWallet(pool, userOpenid);
-    send(res, 0, { balance: money(wallet.coin_balance), balanceBefore, balanceAfter, message: '提现申请已提交，客服审核后将为你处理。' });
+    send(res, 0, { balance: money(wallet.coin_balance), balanceBefore, balanceAfter, amount, feeAmount, payoutAmount, message: `提现申请已提交，扣除 ${feeAmount} 手续费后预计到账 ${payoutAmount} 元；客服审核后处理。` });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '提现申请失败'); }
   finally { if (connection) connection.release(); }
 });
@@ -1327,7 +1347,8 @@ app.post('/api/orders/:id/refund-requests', async (req, res) => {
     if (!order) { await connection.rollback(); return send(res, 4004, null, '订单不存在、已取消或已退款'); }
     const [[existing]] = await connection.query("SELECT id FROM refund_requests WHERE order_id = ? AND status = 'pending' FOR UPDATE", [order.id]);
     if (existing) { await connection.rollback(); return send(res, 4002, null, '该订单已有待处理退款申请'); }
-    const [result] = await connection.query("INSERT INTO refund_requests (order_id, openid, refund_amount, cat_food_to_deduct, reason, evidence_json, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')", [order.id, userOpenid, money(order.total_price), Math.max(0, Number(order.points_earned || 0)), reason, JSON.stringify(evidence)]);
+    const evidenceHistory = evidence.length ? [{ submittedAt: formatDate(new Date()), images: evidence }] : [];
+    const [result] = await connection.query("INSERT INTO refund_requests (order_id, openid, refund_amount, cat_food_to_deduct, reason, evidence_json, evidence_history_json, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')", [order.id, userOpenid, money(order.total_price), Math.max(0, Number(order.points_earned || 0)), reason, JSON.stringify(evidence), JSON.stringify(evidenceHistory)]);
     await connection.commit();
     send(res, 0, { id: Number(result.insertId), orderId: order.id, refundAmount: money(order.total_price), catFoodToDeduct: Math.max(0, Number(order.points_earned || 0)) });
   } catch (error) {
@@ -1340,16 +1361,20 @@ app.post('/api/orders/:id/refund-requests', async (req, res) => {
 function refundRequestRow(row) {
   let evidence = [];
   let rejectEvidence = [];
+  let evidenceHistory = [];
   try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
   try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
-  return { ...orderRow(row), refund: { id: Number(row.refund_id), status: row.refund_status, amount: money(row.refund_amount), reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], createdAt: formatDate(row.refund_created_at), reviewedAt: formatDate(row.reviewed_at), catFoodToDeduct: Number(row.cat_food_to_deduct || 0) } };
+  try { evidenceHistory = JSON.parse(row.evidence_history_json || '[]'); } catch (_) { evidenceHistory = []; }
+  if (!Array.isArray(evidenceHistory)) evidenceHistory = [];
+  if (!evidenceHistory.length && Array.isArray(evidence) && evidence.length) evidenceHistory = [{ submittedAt: formatDate(row.refund_created_at), images: evidence }];
+  return { ...orderRow(row), refund: { id: Number(row.refund_id), status: row.refund_status, amount: money(row.refund_amount), reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], evidenceHistory, rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], createdAt: formatDate(row.refund_created_at), reviewedAt: formatDate(row.reviewed_at), catFoodToDeduct: Number(row.cat_food_to_deduct || 0) } };
 }
 
 app.get('/api/refund-requests', async (req, res) => {
   const userOpenid = requireOpenid(req, res);
   if (!userOpenid) return;
   try {
-    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.resolution_note, r.external_reference, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status IN ('pending', 'rejected', 'refunded', 'unpaid_closed', 'external_refunded') ORDER BY r.created_at DESC`, [userOpenid]);
+    const [rows] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.evidence_history_json, r.resolution_note, r.external_reference, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.openid = ? AND r.status IN ('pending', 'rejected', 'refunded', 'unpaid_closed', 'external_refunded') ORDER BY r.created_at DESC`, [userOpenid]);
     send(res, 0, { refunds: rows.map(refundRequestRow) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款订单读取失败'); }
 });
@@ -1360,7 +1385,7 @@ app.get('/api/refund-requests/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return send(res, 4002, null, '退款申请无效');
   try {
-    const [[row]] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.resolution_note, r.external_reference, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.id = ? AND r.openid = ?`, [id, userOpenid]);
+    const [[row]] = await pool.query(`SELECT o.*, r.id AS refund_id, r.status AS refund_status, r.refund_amount, r.cat_food_to_deduct, r.reason, r.reject_reason, r.reject_evidence_json, r.evidence_json, r.evidence_history_json, r.resolution_note, r.external_reference, r.created_at AS refund_created_at, r.reviewed_at FROM refund_requests r JOIN orders o ON o.id = r.order_id WHERE r.id = ? AND r.openid = ?`, [id, userOpenid]);
     if (!row) return send(res, 4004, null, '退款申请不存在');
     send(res, 0, { refund: refundRequestRow(row) });
   } catch (error) { console.error(error); send(res, 5001, null, '退款详情读取失败'); }
@@ -1376,7 +1401,7 @@ app.post('/api/refund-requests/:id/evidence', async (req, res) => {
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
-    const [[row]] = await connection.query('SELECT evidence_json, status FROM refund_requests WHERE id = ? AND openid = ? FOR UPDATE', [id, userOpenid]);
+    const [[row]] = await connection.query('SELECT evidence_json, evidence_history_json, created_at, status FROM refund_requests WHERE id = ? AND openid = ? FOR UPDATE', [id, userOpenid]);
     if (!row) { await connection.rollback(); return send(res, 4004, null, '退款申请不存在'); }
     if (row.status !== 'pending') { await connection.rollback(); return send(res, 4002, null, '申请已结束审核，无法补充凭据'); }
     let existing;
@@ -1384,7 +1409,12 @@ app.post('/api/refund-requests/:id/evidence', async (req, res) => {
     if (!Array.isArray(existing)) existing = [];
     if (existing.length + additions.length > 6) { await connection.rollback(); return send(res, 4002, null, '申请凭据最多 6 张'); }
     const evidence = existing.concat(additions);
-    await connection.query('UPDATE refund_requests SET evidence_json = ? WHERE id = ?', [JSON.stringify(evidence), id]);
+    let history;
+    try { history = JSON.parse(row.evidence_history_json || '[]'); } catch (_) { history = []; }
+    if (!Array.isArray(history)) history = [];
+    if (!history.length && existing.length) history.push({ submittedAt: formatDate(row.created_at), images: existing });
+    history.push({ submittedAt: formatDate(new Date()), images: additions });
+    await connection.query('UPDATE refund_requests SET evidence_json = ?, evidence_history_json = ? WHERE id = ?', [JSON.stringify(evidence), JSON.stringify(history), id]);
     await connection.commit();
     send(res, 0, { evidence });
   } catch (error) {
@@ -1422,7 +1452,7 @@ app.get('/api/admin/order-ledger', async (req, res) => {
       const [[count]] = await pool.query(`SELECT COUNT(*) AS total FROM partner_gifts g LEFT JOIN gift_refund_requests r ON r.gift_id = g.id ${where}`, params);
       total = Number(count.total || 0);
       const [rows] = await pool.query(`SELECT g.*, r.id AS refund_request_id, r.status AS refund_status FROM partner_gifts g LEFT JOIN gift_refund_requests r ON r.gift_id = g.id ${where} ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?`, [...params, pageSize, offset]);
-      records = rows.map((row) => ({ id: `MG${String(row.id).padStart(8, '0')}`, title: row.gift_name, userName: row.donor_nick_name || '喵伴用户', partnerName: row.recipient_name || '陪陪', amount: money(row.coin_cost), status: row.status, refundStatus: row.refund_status || '', refundRequestId: row.refund_request_id || null, paymentMethod: '金币支付', createdAt: formatDate(row.created_at) }));
+      records = rows.map((row) => ({ id: `MG${String(row.id).padStart(8, '0')}`, title: row.gift_name, userName: row.donor_nick_name || '喵伴用户', partnerName: row.recipient_name || '陪陪', amount: money(row.coin_cost), status: row.status, refundStatus: row.refund_status || '', refundRequestId: row.refund_request_id || null, hasBlessing: !!row.blessing, broadcastOptIn: !!row.broadcast_opt_in, paymentMethod: '金币支付', createdAt: formatDate(row.created_at) }));
     } else {
       const transactionType = type === 'membership' ? ['membership_join', 'membership_upgrade'] : ['recharge_demo'];
       const where = keyword ? ' AND (CAST(t.id AS CHAR) = ? OR t.title LIKE ? OR u.nick_name LIKE ? OR t.openid LIKE ?)' : '';
@@ -1434,6 +1464,25 @@ app.get('/api/admin/order-ledger', async (req, res) => {
     }
     send(res, 0, { type, records, page, pageSize, total, hasMore: offset + records.length < total });
   } catch (error) { console.error(error); send(res, 5001, null, '运营记录读取失败，请确认已执行对应数据库脚本'); }
+});
+
+app.get('/api/admin/order-ledger/gift/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const match = /^(?:MG)?0*(\d+)$/i.exec(String(req.params.id || ''));
+  const id = match ? Number(match[1]) : 0;
+  if (!Number.isSafeInteger(id) || id <= 0) return send(res, 4002, null, '礼物订单编号无效');
+  try {
+    const [[gift]] = await pool.query('SELECT g.*, u.user_no FROM partner_gifts g LEFT JOIN users u ON u.openid = g.openid WHERE g.id = ?', [id]);
+    if (!gift) return send(res, 4004, null, '礼物订单不存在');
+    const giftNo = `MG${String(gift.id).padStart(8, '0')}`;
+    const [[refund]] = await pool.query('SELECT id, status, reason, review_note, created_at, reviewed_at FROM gift_refund_requests WHERE gift_id = ? LIMIT 1', [id]);
+    const [walletRows] = await pool.query("SELECT id, transaction_type, coin_delta, title, created_at FROM wallet_transactions WHERE openid = ? AND order_id = ? AND transaction_type IN ('partner_gift', 'partner_gift_refund') ORDER BY created_at DESC", [gift.openid, giftNo]);
+    send(res, 0, {
+      gift: { id: Number(gift.id), giftNo, giftName: gift.gift_name, amount: money(gift.coin_cost), status: gift.status, donorName: gift.donor_nick_name || '喵伴用户', donorUserNo: gift.user_no || '', recipientName: gift.recipient_name || '陪陪', partnerProfileId: Number(gift.partner_profile_id), blessing: gift.blessing || '', broadcastOptIn: !!gift.broadcast_opt_in, createdAt: formatDate(gift.created_at), refundedAt: formatDate(gift.refunded_at) },
+      refund: refund ? { id: Number(refund.id), status: refund.status, reason: refund.reason || '', reviewNote: refund.review_note || '', createdAt: formatDate(refund.created_at), reviewedAt: formatDate(refund.reviewed_at) } : null,
+      walletRecords: walletRows.map((row) => ({ id: Number(row.id), type: row.transaction_type, title: row.title, coinDelta: Number(row.coin_delta || 0), createdAt: formatDate(row.created_at) }))
+    });
+  } catch (error) { console.error(error); send(res, 5001, null, '礼物订单详情读取失败'); }
 });
 
 app.get('/api/admin/order-ledger/service/:id', async (req, res) => {
@@ -1483,7 +1532,7 @@ app.get('/api/admin/withdrawals', async (req, res) => {
   try {
     const [rows] = await pool.query(`SELECT w.*, u.user_no, u.nick_name FROM withdrawal_requests w
       LEFT JOIN users u ON u.openid = w.openid ORDER BY FIELD(w.status, 'pending', 'approved', 'paid', 'rejected'), w.created_at DESC LIMIT 100`);
-    send(res, 0, { withdrawals: rows.map((row) => ({ id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })) });
+    send(res, 0, { withdrawals: rows.map((row) => ({ id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', amount: money(row.amount), feeAmount: row.fee_amount === null ? null : money(row.fee_amount), payoutAmount: row.payout_amount === null ? null : money(row.payout_amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })) });
   } catch (error) { console.error(error); send(res, 5001, null, '提现审核列表读取失败'); }
 });
 
@@ -1495,7 +1544,7 @@ app.get('/api/admin/withdrawals/:id', async (req, res) => {
     const [[row]] = await pool.query(`SELECT w.*, u.user_no, u.nick_name, u.avatar_url FROM withdrawal_requests w
       LEFT JOIN users u ON u.openid = w.openid WHERE w.id = ?`, [id]);
     if (!row) return send(res, 4004, null, '提现申请不存在');
-    send(res, 0, { withdrawal: { id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at), updatedAt: formatDate(row.updated_at) } });
+    send(res, 0, { withdrawal: { id: Number(row.id), openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', amount: money(row.amount), feeAmount: row.fee_amount === null ? null : money(row.fee_amount), payoutAmount: row.payout_amount === null ? null : money(row.payout_amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at), updatedAt: formatDate(row.updated_at) } });
   } catch (error) { console.error(error); send(res, 5001, null, '提现详情读取失败'); }
 });
 
@@ -1538,14 +1587,17 @@ app.get('/api/admin/refund-requests', async (req, res) => {
       LEFT JOIN orders o ON o.id = r.order_id
       ORDER BY FIELD(r.status, 'pending', 'approved', 'rejected', 'refunded', 'unpaid_closed', 'external_refunded'), r.created_at DESC LIMIT 100`);
     send(res, 0, { refunds: rows.map((row) => {
-      let evidence = []; let rejectEvidence = [];
+      let evidence = []; let rejectEvidence = []; let evidenceHistory = [];
       try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
       try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
+      try { evidenceHistory = JSON.parse(row.evidence_history_json || '[]'); } catch (_) { evidenceHistory = []; }
+      if (!Array.isArray(evidenceHistory)) evidenceHistory = [];
+      if (!evidenceHistory.length && Array.isArray(evidence) && evidence.length) evidenceHistory = [{ submittedAt: formatDate(row.created_at), images: evidence }];
       return {
         id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '',
         partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0),
         orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0),
-        reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status,
+        reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], evidenceHistory: Array.isArray(evidenceHistory) ? evidenceHistory : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status,
         createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at), serviceStartedAt: formatDate(row.service_started_at), serviceCompletedAt: formatDate(row.service_completed_at)
       };
     }) });
@@ -1559,10 +1611,13 @@ app.get('/api/admin/refund-requests/:id', async (req, res) => {
   try {
     const [[row]] = await pool.query(`SELECT r.*, u.user_no, u.nick_name, u.avatar_url, o.partner_name, o.payment_method, o.unit, o.quantity, o.total_price AS order_total_price, o.service_started_at, o.service_completed_at FROM refund_requests r LEFT JOIN users u ON u.openid = r.openid LEFT JOIN orders o ON o.id = r.order_id WHERE r.id = ?`, [id]);
     if (!row) return send(res, 4004, null, '退款申请不存在');
-    let evidence = []; let rejectEvidence = [];
+    let evidence = []; let rejectEvidence = []; let evidenceHistory = [];
     try { evidence = JSON.parse(row.evidence_json || '[]'); } catch (_) { evidence = []; }
     try { rejectEvidence = JSON.parse(row.reject_evidence_json || '[]'); } catch (_) { rejectEvidence = []; }
-    send(res, 0, { refund: { id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0), orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0), reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status, createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at) } });
+    try { evidenceHistory = JSON.parse(row.evidence_history_json || '[]'); } catch (_) { evidenceHistory = []; }
+    if (!Array.isArray(evidenceHistory)) evidenceHistory = [];
+    if (!evidenceHistory.length && Array.isArray(evidence) && evidence.length) evidenceHistory = [{ submittedAt: formatDate(row.created_at), images: evidence }];
+    send(res, 0, { refund: { id: Number(row.id), orderId: row.order_id, openid: row.openid, userNo: row.user_no || '', nickName: row.nick_name || '未完善资料用户', avatarUrl: row.avatar_url || '', partnerName: row.partner_name || '—', paymentMethod: row.payment_method || '—', unit: row.unit || '', quantity: Number(row.quantity || 0), orderTotalPrice: money(row.order_total_price), refundAmount: money(row.refund_amount), catFoodToDeduct: Number(row.cat_food_to_deduct || 0), reason: row.reason || '', rejectReason: row.reject_reason || '', resolutionNote: row.resolution_note || '', externalReference: row.external_reference || '', evidence: Array.isArray(evidence) ? evidence : [], evidenceHistory: Array.isArray(evidenceHistory) ? evidenceHistory : [], rejectEvidence: Array.isArray(rejectEvidence) ? rejectEvidence : [], status: row.status, createdAt: formatDate(row.created_at), reviewedAt: formatDate(row.reviewed_at) } });
   } catch (error) { console.error(error); send(res, 5001, null, '退款审核详情读取失败'); }
 });
 
@@ -1611,7 +1666,14 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
     await ensureWallet(connection, refund.openid);
     const [[wallet]] = await connection.query('SELECT * FROM user_wallets WHERE openid = ? FOR UPDATE', [refund.openid]);
     if (Number(wallet.cat_food_balance || 0) < catFoodToDeduct) { await connection.rollback(); return send(res, 4002, null, `用户猫粮余额不足，需扣回 ${catFoodToDeduct} 猫粮`); }
-    await connection.query("UPDATE orders SET status = 'cancelled', remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：${refundAmount} 金币，原路退回（演示），扣回${catFoodToDeduct}猫粮]`, order.id]);
+    const [growthRows] = await connection.query("SELECT id, growth_delta, status FROM growth_transactions WHERE openid = ? AND order_id = ? AND transaction_type = 'order_consumption' FOR UPDATE", [refund.openid, order.id]);
+    const creditedGrowth = growthRows.filter((row) => row.status === 'credited').reduce((sum, row) => sum + Number(row.growth_delta || 0), 0);
+    if (creditedGrowth) {
+      await ensureGrowth(connection, refund.openid);
+      await connection.query('UPDATE user_growth SET growth_points = GREATEST(0, growth_points - ?) WHERE openid = ?', [creditedGrowth, refund.openid]);
+    }
+    await connection.query("UPDATE growth_transactions SET status = 'reversed' WHERE openid = ? AND order_id = ? AND transaction_type = 'order_consumption' AND status IN ('pending', 'credited')", [refund.openid, order.id]);
+    await connection.query("UPDATE orders SET status = 'cancelled', points_earned = 0, remark = CONCAT(COALESCE(remark, ''), ?) WHERE id = ?", [` [订单退款：${refundAmount} 金币，钱包返还，扣回${catFoodToDeduct}猫粮]`, order.id]);
     let couponReturned = false;
     if (order.coupon_id && !order.service_started_at) {
       const [couponResult] = await connection.query(
@@ -1621,10 +1683,10 @@ app.patch('/api/admin/refund-requests/:id/status', async (req, res) => {
       couponReturned = couponResult.affectedRows > 0;
     }
     await connection.query('UPDATE user_wallets SET coin_balance = coin_balance + ?, cat_food_balance = cat_food_balance - ? WHERE openid = ?', [refundAmount, catFoodToDeduct, refund.openid]);
-    await addWalletRecord(connection, refund.openid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（原路退款演示）', amount: refundAmount, orderId: order.id });
+    await addWalletRecord(connection, refund.openid, { coinDelta: refundAmount, catFoodDelta: -catFoodToDeduct, type: 'order_refund', title: '订单退款（金币钱包返还）', amount: refundAmount, orderId: order.id });
     await connection.query("UPDATE refund_requests SET status = 'refunded', refund_amount = ?, cat_food_to_deduct = ?, reviewer_openid = ?, reviewed_at = NOW() WHERE id = ?", [refundAmount, catFoodToDeduct, reviewerOpenid, id]);
     await connection.commit();
-    send(res, 0, { id, status: 'refunded', refundAmount, catFoodToDeduct, couponReturned, refundRoute: order.payment_method || '原支付路径（演示）' });
+    send(res, 0, { id, status: 'refunded', refundAmount, catFoodToDeduct, couponReturned, refundRoute: '金币钱包' });
   } catch (error) { if (connection) await connection.rollback(); console.error(error); send(res, 5001, null, '退款审核处理失败'); }
   finally { if (connection) connection.release(); }
 });
@@ -1775,7 +1837,7 @@ app.get('/api/admin/users/:openid/detail', async (req, res) => {
         coinBalance: money(wallet.coin_balance), catFoodBalance: Number(wallet.cat_food_balance || 0), couponBalance: coupons.filter((row) => row.status === 'unused').length
       },
       orders: orders.map(orderRow),
-      withdrawals: withdrawals.map((row) => ({ id: Number(row.id), amount: money(row.amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })),
+      withdrawals: withdrawals.map((row) => ({ id: Number(row.id), amount: money(row.amount), feeAmount: row.fee_amount === null ? null : money(row.fee_amount), payoutAmount: row.payout_amount === null ? null : money(row.payout_amount), balanceBefore: row.balance_before === null ? null : money(row.balance_before), balanceAfter: row.balance_after === null ? null : money(row.balance_after), status: row.status, createdAt: formatDate(row.created_at) })),
       walletRecords: walletRecords.map((row) => ({ id: Number(row.id), title: row.title, transactionType: row.transaction_type, coinDelta: money(row.coin_delta), catFoodDelta: Number(row.cat_food_delta || 0), amount: money(row.amount), orderId: row.order_id || '', createdAt: formatDate(row.created_at) })),
       coupons: coupons.map((row) => ({ id: Number(row.id), amount: money(row.amount), catFoodCost: Number(row.cat_food_cost), status: row.status, createdAt: formatDate(row.created_at), usedAt: formatDate(row.used_at) })),
       lotteryRecords: []
